@@ -59,13 +59,13 @@ async def _run_cmd(cmd: list) -> tuple:
 
 
 async def get_video_info(path: str):
-    out, _, code = await _run_cmd([
-        "ffprobe", "-hide_banner", "-loglevel", "error",
-        "-print_format", "json", "-show_format", "-show_streams", path,
-    ])
-    if code != 0:
-        return 0, 640, 480
     try:
+        out, _, code = await _run_cmd([
+            "ffprobe", "-hide_banner", "-loglevel", "error",
+            "-print_format", "json", "-show_format", "-show_streams", path,
+        ])
+        if code != 0:
+            return 0, 640, 480
         data = json.loads(out)
         duration = int(float(data.get("format", {}).get("duration", 0)))
         w, h = 640, 480
@@ -74,20 +74,29 @@ async def get_video_info(path: str):
                 w, h = s.get("width", 640), s.get("height", 480)
                 break
         return duration, w, h
+    except FileNotFoundError:
+        # ffprobe not installed — return safe defaults
+        return 0, 0, 0
     except Exception:
         return 0, 640, 480
 
 
 async def make_thumbnail(path: str, duration: int, msg_id: int):
-    os.makedirs("thumbs", exist_ok=True)
-    out = f"thumbs/thumb_{msg_id}.jpg"
-    seek = max(duration // 2, 1)
-    _, _, code = await _run_cmd([
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-ss", str(seek), "-i", path,
-        "-vframes", "1", "-q:v", "2", "-y", out,
-    ])
-    return out if code == 0 and os.path.exists(out) else None
+    try:
+        os.makedirs("thumbs", exist_ok=True)
+        out = f"thumbs/thumb_{msg_id}.jpg"
+        seek = max(duration // 2, 1)
+        _, _, code = await _run_cmd([
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", str(seek), "-i", path,
+            "-vframes", "1", "-q:v", "2", "-y", out,
+        ])
+        return out if code == 0 and os.path.exists(out) else None
+    except FileNotFoundError:
+        # ffmpeg not installed
+        return None
+    except Exception:
+        return None
 
 
 # ── Progress text ─────────────────────────────────────────────────────────────
@@ -122,10 +131,14 @@ async def send_file(
         elif media_type == "video":
             dur, w, h = await get_video_info(media_path)
             thumb = await make_thumbnail(media_path, dur, msg_id)
-            await bot.send_video(
-                video=media_path, duration=dur, width=w, height=h,
-                thumb=thumb, supports_streaming=True, **kwargs,
-            )
+            if w == 0 and h == 0:
+                # ffprobe not available — send as document to avoid crash
+                await bot.send_document(document=media_path, **kwargs)
+            else:
+                await bot.send_video(
+                    video=media_path, duration=dur, width=w, height=h,
+                    thumb=thumb, supports_streaming=True, **kwargs,
+                )
         elif media_type == "audio":
             await bot.send_audio(audio=media_path, **kwargs)
         else:
