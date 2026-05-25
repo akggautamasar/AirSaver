@@ -1,7 +1,7 @@
 """
 Main message handler.
 Detects links, ranges, /batch, /playlist commands.
-Each user's job runs in its own asyncio.Task.
+Each user's job runs in its own asyncio.Task so users don't block each other.
 """
 import asyncio
 from pyrogram import Client, filters
@@ -10,19 +10,15 @@ from pyrogram.types import Message, CallbackQuery
 from config import LOGIN_SYSTEM
 from database.db import db
 from helpers.msg import parse_range_input, parse_playlist_input
-from helpers.keyboards import kb_start_menu, kb_cancel_only
+from helpers.keyboards import kb_cancel_only  # kb_start_menu removed (unused)
 from helpers.downloader import (
-    run_batch, register_task, cancel_task, has_running_task, RUNNING_TASKS
+    run_batch, register_task, cancel_task, has_running_task,
 )
+
 
 # ── Utility: get user's Pyrogram client ───────────────────────────────────────
 async def get_acc(bot: Client, message: Message):
-    """
-    Returns a connected user Client for the sender, or None if not logged in.
-    Handles both LOGIN_SYSTEM modes.
-    """
     if not LOGIN_SYSTEM:
-        # shared session — use the global TechVJUser
         from bot import TechVJUser
         if TechVJUser is None:
             await message.reply("❌ No shared session configured. Ask the admin.")
@@ -46,9 +42,7 @@ async def get_acc(bot: Client, message: Message):
         await acc.connect()
         return acc
     except Exception:
-        await message.reply(
-            "❌ Your session has expired. Please /logout and /login again."
-        )
+        await message.reply("❌ Your session has expired. Please /logout and /login again.")
         return None
 
 
@@ -63,6 +57,8 @@ async def _disconnect_if_needed(acc):
 # ── /cancel ───────────────────────────────────────────────────────────────────
 @Client.on_message(filters.private & filters.command("cancel"))
 async def cmd_cancel(client: Client, message: Message):
+    # Also clear playlist waiting state
+    _WAITING_PLAYLIST.discard(message.from_user.id)
     if cancel_task(message.from_user.id):
         await message.reply("🛑 **Task cancelled.**")
     else:
@@ -71,6 +67,7 @@ async def cmd_cancel(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex("^cancel_task$"))
 async def cb_cancel(client: Client, cb: CallbackQuery):
+    _WAITING_PLAYLIST.discard(cb.from_user.id)
     if cancel_task(cb.from_user.id):
         await cb.message.edit("🛑 **Task cancelled by user.**")
     else:
@@ -91,16 +88,13 @@ async def cmd_status(client: Client, message: Message):
 async def cmd_batch(bot: Client, message: Message):
     user_id = message.from_user.id
     if has_running_task(user_id):
-        return await message.reply(
-            "⚠️ You already have a running task. Use /cancel first."
-        )
+        return await message.reply("⚠️ You already have a running task. Use /cancel first.")
 
     args = message.text.split(None, 1)
     if len(args) < 2:
         return await message.reply(
             "**Batch Download**\n\n"
             "Usage: `/batch <start_link> - <end_link>`\n\n"
-            "Or just send two links in one message separated by ` - `\n\n"
             "Works with topic links too:\n"
             "`https://t.me/c/123/5/101 - https://t.me/c/123/5/200`"
         )
@@ -118,34 +112,25 @@ async def cmd_batch(bot: Client, message: Message):
         try:
             for i, (chat_id, start_id, end_id, topic_id) in enumerate(jobs, 1):
                 label = f"Batch {i}/{len(jobs)}" if len(jobs) > 1 else "Batch"
-                await run_batch(
-                    bot, acc, message,
-                    chat_id, start_id, end_id,
-                    message.chat.id,
-                    topic_id=topic_id,
-                    job_label=label,
-                )
+                await run_batch(bot, acc, message, chat_id, start_id, end_id,
+                                message.chat.id, topic_id=topic_id, job_label=label)
         except asyncio.CancelledError:
             pass
         finally:
             await _disconnect_if_needed(acc)
 
-    task = asyncio.create_task(_run())
-    register_task(user_id, task)
+    register_task(user_id, asyncio.create_task(_run()))
 
 
 # ── /playlist ─────────────────────────────────────────────────────────────────
-# State: waiting for playlist links from user
-_WAITING_PLAYLIST: set[int] = set()
+_WAITING_PLAYLIST: set = set()
 
 
 @Client.on_message(filters.private & filters.command("playlist"))
 async def cmd_playlist(bot: Client, message: Message):
     user_id = message.from_user.id
     if has_running_task(user_id):
-        return await message.reply(
-            "⚠️ You already have a running task. Use /cancel first."
-        )
+        return await message.reply("⚠️ You already have a running task. Use /cancel first.")
 
     _WAITING_PLAYLIST.add(user_id)
     await message.reply(
@@ -159,14 +144,18 @@ async def cmd_playlist(bot: Client, message: Message):
         "<code>https://t.me/channel/101\n"
         "https://t.me/c/123456/5/200 - https://t.me/c/123456/5/250\n"
         "https://t.me/group/10/305</code>\n\n"
-        "Send all links in a **single message** when ready."
+        "Send all links in a **single message** when ready.\n"
+        "Send /cancel to abort."
     )
 
 
 # ── Generic text handler ──────────────────────────────────────────────────────
 @Client.on_message(
     filters.private & filters.text
-    & ~filters.command(["start","help","login","logout","cancel","status","batch","playlist","logs","stats","broadcast"])
+    & ~filters.command([
+        "start", "help", "login", "logout", "cancel",
+        "status", "batch", "playlist", "logs", "stats", "broadcast"
+    ])
 )
 async def handle_text(bot: Client, message: Message):
     user_id = message.from_user.id
@@ -174,16 +163,18 @@ async def handle_text(bot: Client, message: Message):
 
     # ── Playlist links received ────────────────────────────────────────────────
     if user_id in _WAITING_PLAYLIST:
-        _WAITING_PLAYLIST.discard(user_id)
-
+        # fix: ignore non-link messages while waiting (e.g. stray text)
         if "t.me" not in text:
-            return await message.reply("❌ No valid links found. Use /playlist to try again.")
+            return await message.reply(
+                "❌ No valid links found in that message.\n"
+                "Send your links (one per line) or /cancel to abort."
+            )
 
+        _WAITING_PLAYLIST.discard(user_id)
         jobs, errors = parse_playlist_input(text)
 
         if errors:
-            err_text = "\n".join(errors[:5])
-            await message.reply(f"⚠️ Some lines were skipped:\n{err_text}")
+            await message.reply("⚠️ Some lines were skipped:\n" + "\n".join(errors[:5]))
 
         if not jobs:
             return await message.reply("❌ No valid links found. Use /playlist to try again.")
@@ -197,22 +188,17 @@ async def handle_text(bot: Client, message: Message):
 
         total_jobs = len(jobs)
         confirm_msg = await message.reply(
-            f"🎵 **Playlist ready: {total_jobs} job(s)**\n\n"
-            f"All posts will be sent to this chat.\n"
-            f"Starting now...",
+            f"🎵 **Playlist ready: {total_jobs} job(s)**\n\nStarting now...",
             reply_markup=kb_cancel_only(),
         )
 
         async def _run_playlist():
             try:
                 for i, (chat_id, start_id, end_id, topic_id) in enumerate(jobs, 1):
-                    label = f"Playlist {i}/{total_jobs}"
                     await run_batch(
-                        bot, acc, message,
-                        chat_id, start_id, end_id,
-                        message.chat.id,
-                        topic_id=topic_id,
-                        job_label=label,
+                        bot, acc, message, chat_id, start_id, end_id,
+                        message.chat.id, topic_id=topic_id,
+                        job_label=f"Playlist {i}/{total_jobs}",
                     )
             except asyncio.CancelledError:
                 try:
@@ -222,13 +208,12 @@ async def handle_text(bot: Client, message: Message):
             finally:
                 await _disconnect_if_needed(acc)
 
-        task = asyncio.create_task(_run_playlist())
-        register_task(user_id, task)
+        register_task(user_id, asyncio.create_task(_run_playlist()))
         return
 
-    # ── Regular link(s) ────────────────────────────────────────────────────────
+    # ── Regular link ──────────────────────────────────────────────────────────
     if "t.me" not in text:
-        return  # ignore unrelated text
+        return
 
     if has_running_task(user_id):
         return await message.reply(
@@ -240,13 +225,9 @@ async def handle_text(bot: Client, message: Message):
     except ValueError as e:
         return await message.reply(f"❌ {e}")
 
-    is_range = (jobs[0][1] != jobs[0][2])  # start_id != end_id → it's a range
+    is_range = (jobs[0][1] != jobs[0][2])
     total = sum(end - start + 1 for _, start, end, _ in jobs)
-
-    if is_range:
-        label = f"Batch ({total} posts)"
-    else:
-        label = "Single post"
+    label = f"Batch ({total} posts)" if is_range else "Single post"
 
     acc = await get_acc(bot, message)
     if not acc:
@@ -256,17 +237,11 @@ async def handle_text(bot: Client, message: Message):
         try:
             for i, (chat_id, start_id, end_id, topic_id) in enumerate(jobs, 1):
                 jlabel = f"{label} {i}/{len(jobs)}" if len(jobs) > 1 else label
-                await run_batch(
-                    bot, acc, message,
-                    chat_id, start_id, end_id,
-                    message.chat.id,
-                    topic_id=topic_id,
-                    job_label=jlabel,
-                )
+                await run_batch(bot, acc, message, chat_id, start_id, end_id,
+                                message.chat.id, topic_id=topic_id, job_label=jlabel)
         except asyncio.CancelledError:
             pass
         finally:
             await _disconnect_if_needed(acc)
 
-    task = asyncio.create_task(_run_jobs())
-    register_task(user_id, task)
+    register_task(user_id, asyncio.create_task(_run_jobs()))
