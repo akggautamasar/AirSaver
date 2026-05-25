@@ -79,7 +79,7 @@ def parse_range_input(text: str):
     # Try range split: "link1 - link2" or "link1\nlink2" when only 2 lines
     # We'll handle multiline playlist separately in the plugin.
     # Here we handle a single entry that may itself be a range.
-    separators = [" - ", "\n"]
+    separators = [" - "]
     parts = None
     for sep in separators:
         if sep in text:
