@@ -20,6 +20,7 @@ from helpers.files import (
     get_readable_time, cleanup_download, check_file_size,
 )
 from helpers.msg import get_parsed_msg, clean_caption, apply_caption_rules, get_file_name
+from helpers.keyboards import kb_cancel_only  # fix: proper import not lazy __import__
 
 # ── Running tasks registry (per user_id) ──────────────────────────────────────
 RUNNING_TASKS: dict[int, asyncio.Task] = {}
@@ -43,7 +44,7 @@ def has_running_task(user_id: int) -> bool:
 
 
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
-async def _run_cmd(cmd: list) -> tuple[str, str, int]:
+async def _run_cmd(cmd: list) -> tuple:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -77,7 +78,7 @@ async def get_video_info(path: str):
         return 0, 640, 480
 
 
-async def make_thumbnail(path: str, duration: int, msg_id: int) -> str | None:
+async def make_thumbnail(path: str, duration: int, msg_id: int):
     os.makedirs("thumbs", exist_ok=True)
     out = f"thumbs/thumb_{msg_id}.jpg"
     seek = max(duration // 2, 1)
@@ -94,20 +95,20 @@ def progress_text(filename: str, done: int, total: int, job_label: str = "") -> 
     pct = (done / total * 100) if total else 0
     bar_filled = int(pct / 10)
     bar = "█" * bar_filled + "░" * (10 - bar_filled)
-    text = (
+    return (
         f"<b>{'📥 ' + job_label if job_label else '📥 Processing'}</b>\n\n"
         f"<code>{filename[:50]}</code>\n\n"
         f"[{bar}] {pct:.1f}%\n"
         f"<b>{done}</b> / <b>{total}</b> done"
     )
-    return text
 
 
 # ── Send a single downloaded file ─────────────────────────────────────────────
-async def send_file(bot: Client, chat_id: int, media_path: str,
-                    media_type: str, caption: str,
-                    topic_id: int | None = None,
-                    reply_markup=None, msg_id: int = 0) -> bool:
+async def send_file(
+    bot: Client, chat_id: int, media_path: str,
+    media_type: str, caption: str,
+    topic_id=None, reply_markup=None, msg_id: int = 0,
+) -> bool:
     kwargs = dict(
         chat_id=chat_id,
         caption=caption or "",
@@ -139,7 +140,10 @@ async def send_file(bot: Client, chat_id: int, media_path: str,
         return False
     finally:
         if thumb and os.path.exists(thumb):
-            os.remove(thumb)
+            try:
+                os.remove(thumb)
+            except Exception:
+                pass
 
 
 # ── Download + send one message ───────────────────────────────────────────────
@@ -147,9 +151,9 @@ async def process_one(
     bot: Client, acc: Client,
     chat_id, msg_id: int,
     target_chat_id: int,
-    topic_id: int | None = None,
-    caption_rules: list | None = None,
-    status_msg: Message | None = None,
+    topic_id=None,
+    caption_rules=None,
+    status_msg: Message = None,
     job_label: str = "",
 ):
     media_path = None
@@ -158,13 +162,11 @@ async def process_one(
         if not msg or msg.empty:
             return "skip"
 
-        # Caption
         caption = await get_parsed_msg(msg)
         caption = clean_caption(caption)
         if caption_rules:
             caption = apply_caption_rules(caption, caption_rules)
 
-        # Text only
         has_media = bool(
             msg.document or msg.video or msg.audio or msg.photo
             or msg.animation or msg.voice or msg.video_note or msg.sticker
@@ -184,18 +186,24 @@ async def process_one(
                 )
             return "ok"
 
-        # Check size
+        # Check file size — fix: use status_msg only if it's a real Message
         media_obj = (msg.document or msg.video or msg.audio or msg.photo
                      or msg.animation or msg.voice or msg.video_note or msg.sticker)
         file_size = getattr(media_obj, "file_size", 0) or 0
-        is_premium = getattr(acc.me, "is_premium", False) if acc.me else False
-        if not await check_file_size(file_size, status_msg or bot, "download", is_premium):
+
+        # fix: get is_premium properly via get_me() since acc.me may be None
+        try:
+            me = await acc.get_me()
+            is_premium = getattr(me, "is_premium", False)
+        except Exception:
+            is_premium = False
+
+        if file_size and not await check_file_size(file_size, status_msg, "download", is_premium):
             return "skip"
 
         filename = get_file_name(msg_id, msg)
         media_path = get_download_path(msg_id, filename)
 
-        # Download with retry
         for attempt in range(3):
             try:
                 media_path = await msg.download(file_name=media_path)
@@ -244,8 +252,8 @@ async def process_one(
 # ── Media group ───────────────────────────────────────────────────────────────
 async def process_media_group(
     bot: Client, acc: Client, trigger_msg,
-    target_chat_id: int, topic_id: int | None,
-    caption_rules: list | None,
+    target_chat_id: int, topic_id,
+    caption_rules,
 ):
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     try:
@@ -278,8 +286,10 @@ async def process_media_group(
     results = await asyncio.gather(*[_dl_one(m) for m in group_msgs])
     paths, media_list = [], []
     for path, media in results:
-        if path: paths.append(path)
-        if media: media_list.append(media)
+        if path:
+            paths.append(path)
+        if media:
+            media_list.append(media)
 
     if media_list:
         try:
@@ -303,8 +313,8 @@ async def run_batch(
     origin_msg: Message,
     chat_id, start_id: int, end_id: int,
     target_chat_id: int,
-    topic_id: int | None = None,
-    caption_rules: list | None = None,
+    topic_id=None,
+    caption_rules=None,
     job_label: str = "",
 ):
     total = end_id - start_id + 1
@@ -313,7 +323,7 @@ async def run_batch(
 
     status_msg = await origin_msg.reply(
         progress_text("Starting...", 0, total, job_label),
-        reply_markup=__import__("helpers.keyboards", fromlist=["kb_cancel_only"]).kb_cancel_only(),
+        reply_markup=kb_cancel_only(),
     )
 
     current = start_id
@@ -373,7 +383,7 @@ async def run_batch(
                     fname = get_file_name(msg.id, msg) if msg else "..."
                     await status_msg.edit(
                         progress_text(fname, done, total, job_label),
-                        reply_markup=__import__("helpers.keyboards", fromlist=["kb_cancel_only"]).kb_cancel_only(),
+                        reply_markup=kb_cancel_only(),
                     )
                     last_edit = time()
                 except Exception:
@@ -382,7 +392,7 @@ async def run_batch(
             await asyncio.sleep(WAITING_TIME)
 
         if ref_expired_at is not None:
-            current = ref_expired_at  # retry from here
+            current = ref_expired_at
             await asyncio.sleep(2)
             continue
 
