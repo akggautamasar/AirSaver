@@ -5,7 +5,7 @@
 import os
 
 # Login feature, if you want then True , if you don't want then False
-LOGIN_SYSTEM = bool(os.environ.get('LOGIN_SYSTEM', True)) # True or False
+LOGIN_SYSTEM = bool(os.environ.get('LOGIN_SYSTEM', False)) # True or False
 
 if LOGIN_SYSTEM == False:
     # if login system is False then fill your tg account session below 
