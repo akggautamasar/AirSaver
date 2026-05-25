@@ -1,0 +1,100 @@
+import os
+import shutil
+import psutil
+import asyncio
+from time import time
+
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+
+from database.db import db
+from helpers.files import get_readable_file_size, get_readable_time
+from config import ADMINS
+
+BOT_START_TIME = time()
+
+
+@Client.on_message(filters.private & filters.command("start"))
+async def start(client: Client, message: Message):
+    if not await db.is_user_exist(message.from_user.id):
+        await db.add_user(message.from_user.id, message.from_user.first_name)
+
+    session = await db.get_session(message.from_user.id)
+    status = "✅ Logged in" if session else "❌ Not logged in — use /login"
+
+    await message.reply(
+        f"👋 **Hi {message.from_user.mention}!**\n\n"
+        "I can save restricted content from any Telegram channel or group — "
+        "including **topic threads**.\n\n"
+        f"**Account status:** {status}\n\n"
+        "**Commands:**\n"
+        "• Send any post link → download it\n"
+        "• `link1 - link2` → batch range download\n"
+        "• /batch `<link1> - <link2>` → same as above\n"
+        "• /playlist → send multiple links at once\n"
+        "• /cancel → stop your current task\n"
+        "• /status → check if a task is running\n"
+        "• /help → full help\n",
+        disable_web_page_preview=True,
+    )
+
+
+@Client.on_message(filters.private & filters.command("help"))
+async def help_cmd(client: Client, message: Message):
+    await message.reply(
+        "📖 **Help — AirSaver Pro**\n\n"
+        "**Single post:**\n"
+        "`https://t.me/channel/123`\n\n"
+        "**Batch range (same chat):**\n"
+        "`https://t.me/channel/100 - https://t.me/channel/200`\n\n"
+        "**Private channel:**\n"
+        "`https://t.me/c/1234567890/123`\n\n"
+        "**Group topic:**\n"
+        "`https://t.me/c/1234567890/5/123`\n"
+        "`https://t.me/groupusername/5/123`\n\n"
+        "**Topic batch range:**\n"
+        "`https://t.me/c/123/5/100 - https://t.me/c/123/5/200`\n\n"
+        "**Playlist (many links at once):**\n"
+        "Use /playlist → then send all links, one per line.\n"
+        "Each line can be a single link or a range.\n\n"
+        "**Controls:**\n"
+        "/cancel — stop your running task\n"
+        "/status — check task status\n"
+        "/login — connect your Telegram account\n"
+        "/logout — disconnect your account\n",
+        disable_web_page_preview=True,
+    )
+
+
+@Client.on_message(filters.private & filters.command("stats"))
+async def stats(client: Client, message: Message):
+    uptime = get_readable_time(time() - BOT_START_TIME)
+    total_users = await db.total_users_count()
+
+    def _sys():
+        t, _, f = shutil.disk_usage(".")
+        return (
+            get_readable_file_size(t), get_readable_file_size(f),
+            psutil.cpu_percent(interval=0.5),
+            psutil.virtual_memory().percent,
+            round(psutil.Process(os.getpid()).memory_info()[0] / 1024 ** 2),
+        )
+
+    disk_total, disk_free, cpu, ram, proc_mem = await asyncio.to_thread(_sys)
+
+    await message.reply(
+        f"📊 **Bot Stats**\n\n"
+        f"⏱ Uptime: `{uptime}`\n"
+        f"👥 Total users: `{total_users}`\n"
+        f"💾 Disk: `{disk_free}` free of `{disk_total}`\n"
+        f"🖥 CPU: `{cpu}%` | RAM: `{ram}%`\n"
+        f"🤖 Bot mem: `{proc_mem} MiB`"
+    )
+
+
+@Client.on_message(filters.private & filters.command("logs") & filters.user(ADMINS))
+async def logs(client: Client, message: Message):
+    if os.path.exists("logs.txt"):
+        await message.reply_document("logs.txt", caption="📋 Logs")
+    else:
+        await message.reply("No log file found.")
