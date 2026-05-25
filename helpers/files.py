@@ -42,9 +42,12 @@ def cleanup_download(path: str):
 async def check_file_size(file_size: int, message, action: str = "download", is_premium: bool = False) -> bool:
     limit = 4 * 1024 * 1024 * 1024 if is_premium else 2 * 1024 * 1024 * 1024
     if file_size and file_size > limit:
-        await message.reply(
+        msg = (
             f"❌ File size **{get_readable_file_size(file_size)}** exceeds "
             f"the **{get_readable_file_size(limit)}** {action} limit."
         )
+        # only reply if message is a real Message object with .reply()
+        if message and hasattr(message, "reply"):
+            await message.reply(msg)
         return False
     return True
