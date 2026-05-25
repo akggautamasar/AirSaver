@@ -45,15 +45,14 @@ async def login(bot: Client, message: Message):
         reply_markup=kb_login_help(),
     )
 
-    def _from_user(_, __, m):
-        return m.from_user and m.from_user.id == user_id
-
-    user_filter = filters.create(_from_user) & filters.private & filters.text
-
     async def ask(prompt: str, timeout: int = 300) -> Message | None:
         await bot.send_message(user_id, prompt)
         try:
-            return await bot.listen(user_id, filters=user_filter, timeout=timeout)
+            return await bot.listen(
+                chat_id=user_id,
+                filters=filters.text & filters.private,
+                timeout=timeout,
+            )
         except asyncio.TimeoutError:
             await bot.send_message(user_id, "⏰ Timed out. Please start again with /login.")
             return None
