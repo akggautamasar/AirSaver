@@ -16,7 +16,7 @@ from pyrogram.errors import FloodWait, FileReferenceExpired, PeerIdInvalid, BadR
 from config import WAITING_TIME, MAX_CONCURRENT
 from logger import LOGGER
 from helpers.files import (
-    get_download_path, get_file_name, get_readable_file_size,
+    get_download_path, get_readable_file_size,
     get_readable_time, cleanup_download, check_file_size,
 )
 from helpers.msg import get_parsed_msg, clean_caption, apply_caption_rules, get_file_name
