@@ -1,3 +1,4 @@
+import os
 import re
 from pyrogram.utils import get_channel_id
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -171,21 +172,38 @@ def apply_caption_rules(caption: str, rules: list) -> str:
     return caption.strip()
 
 
+def _sanitize_filename(name: str, msg_id: int) -> str:
+    """Strip path components and dangerous characters; prevent path traversal."""
+    if not name:
+        return str(msg_id)
+    # Take just the basename — discard any directory components
+    name = os.path.basename(name.replace("\\", "/"))
+    # Strip null bytes and control chars
+    name = "".join(c for c in name if c.isprintable() and c not in '\x00\r\n')
+    # Strip leading dots (prevents hidden files / .. tricks)
+    name = name.lstrip(".")
+    # Cap length
+    name = name[:200]
+    return name or str(msg_id)
+
+
 def get_file_name(message_id: int, chat_message) -> str:
     if chat_message.document:
-        return chat_message.document.file_name or str(message_id)
+        raw = chat_message.document.file_name or str(message_id)
     elif chat_message.video:
-        return chat_message.video.file_name or f"{message_id}.mp4"
+        raw = chat_message.video.file_name or f"{message_id}.mp4"
     elif chat_message.audio:
-        return chat_message.audio.file_name or f"{message_id}.mp3"
+        raw = chat_message.audio.file_name or f"{message_id}.mp3"
     elif chat_message.voice:
-        return f"{message_id}.ogg"
+        raw = f"{message_id}.ogg"
     elif chat_message.video_note:
-        return f"{message_id}.mp4"
+        raw = f"{message_id}.mp4"
     elif chat_message.animation:
-        return chat_message.animation.file_name or f"{message_id}.gif"
+        raw = chat_message.animation.file_name or f"{message_id}.gif"
     elif chat_message.sticker:
-        return f"{message_id}.webp"
+        raw = f"{message_id}.webp"
     elif chat_message.photo:
-        return f"{message_id}.jpg"
-    return str(message_id)
+        raw = f"{message_id}.jpg"
+    else:
+        raw = str(message_id)
+    return _sanitize_filename(raw, message_id)
