@@ -66,3 +66,6 @@ class Database:
         if not doc:
             return None, None
         return doc.get("destination"), doc.get("dest_label")
+
+
+db = Database(DB_URI, DB_NAME)
