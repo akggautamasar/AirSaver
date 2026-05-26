@@ -592,16 +592,59 @@ async def run_batch(
             )
 
     # ── Pipelined download → upload ───────────────────────────────────────────
-    # We fetch messages, queue downloads, and start uploads as soon as each finishes.
-    # Up to PIPELINE_DEPTH downloads run in parallel.
+    # Up to PARALLEL_FILES downloads run in parallel; uploads happen as items finish.
 
-    upload_queue: asyncio.Queue = asyncio.Queue(maxsize=PIPELINE_DEPTH + 1)
+    upload_queue: asyncio.Queue = asyncio.Queue()
     download_sem = asyncio.Semaphore(PARALLEL_FILES)
     stop_signal = asyncio.Event()
+    pending_downloads: list = []  # Track all spawned download tasks
+
+    async def _handle_result(result, msg):
+        nonlocal done, skipped, failed, success
+        try:
+            if isinstance(result, DownloadedItem):
+                ok = await upload_item(bot, result, target_chat_id, topic_id, progress)
+                if ok:
+                    success += 1
+                else:
+                    failed += 1
+                done += 1
+            elif result == "ok":
+                success += 1
+                done += 1
+            elif result == "skip":
+                skipped += 1
+                done += 1
+            elif result == "ref_expired":
+                failed += 1
+                done += 1
+            else:
+                failed += 1
+                done += 1
+            progress.batch_done = done
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            LOGGER(__name__).error(f"Pipeline upload error: {e}")
+            failed += 1
+            done += 1
+
+    async def _dl_and_queue(m):
+        """Download a message, then push the result to the upload queue."""
+        try:
+            async with download_sem:
+                if stop_signal.is_set():
+                    return
+                result = await download_msg(acc, m, caption_rules, user_id, progress)
+            await upload_queue.put((result, m))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            LOGGER(__name__).error(f"Download task error msg {m.id}: {e}")
+            await upload_queue.put(("error", m))
 
     async def producer():
         """Fetch messages and feed downloads into the pipeline."""
-        nonlocal skipped, done
         current = start_id
 
         while current <= end_id and not stop_signal.is_set():
@@ -632,7 +675,8 @@ async def run_batch(
                         continue
                     processed_groups.add(msg.media_group_id)
 
-                # Simple cases (text, media group) bypass the pipeline
+                # Simple cases (text, media group) bypass the download pipeline.
+                # process_simple actually sends the message inline; just queue a result.
                 simple_result = await process_simple(
                     bot, acc, msg, target_chat_id, topic_id, caption_rules, progress,
                 )
@@ -640,73 +684,40 @@ async def run_batch(
                     await upload_queue.put((simple_result, None))
                     continue
 
-                # Download in background, push result to queue
-                async def _dl_and_queue(m):
-                    async with download_sem:
-                        if stop_signal.is_set():
-                            return
-                        result = await download_msg(acc, m, caption_rules, user_id, progress)
-                        await upload_queue.put((result, m))
+                # Throttle the producer if too many downloads are queued
+                # (prevents memory blowup with very large batches)
+                while len(pending_downloads) - sum(1 for t in pending_downloads if t.done()) >= PARALLEL_FILES + 1:
+                    await asyncio.sleep(0.5)
 
-                asyncio.create_task(_dl_and_queue(msg))
+                # Spawn the download — TRACKED in pending_downloads
+                task = asyncio.create_task(_dl_and_queue(msg))
+                pending_downloads.append(task)
 
                 await asyncio.sleep(WAITING_TIME)
 
             current = chunk_end + 1
 
-        # Signal end of work
+        # All messages fetched. Wait for all downloads to finish, THEN signal end.
+        if pending_downloads:
+            await asyncio.gather(*pending_downloads, return_exceptions=True)
         await upload_queue.put(("__END__", None))
 
     async def consumer():
-        """Upload completed downloads sequentially in order."""
-        nonlocal done, skipped, failed, success
+        """Upload completed downloads as they arrive."""
         while True:
             result, msg = await upload_queue.get()
-
             if result == "__END__":
-                # Wait for any still-running downloads
-                while not upload_queue.empty():
-                    result, msg = await upload_queue.get()
-                    await _handle_result(result, msg)
                 return
-
             await _handle_result(result, msg)
-
-    async def _handle_result(result, msg):
-        nonlocal done, skipped, failed, success
-        try:
-            if isinstance(result, DownloadedItem):
-                ok = await upload_item(bot, result, target_chat_id, topic_id, progress)
-                if ok:
-                    success += 1
-                else:
-                    failed += 1
-                done += 1
-            elif result == "ok":
-                success += 1
-                done += 1
-            elif result == "skip":
-                skipped += 1
-                done += 1
-            elif result == "ref_expired":
-                # Hard to handle gracefully in pipeline — count as failure
-                failed += 1
-                done += 1
-            else:
-                failed += 1
-                done += 1
-            progress.batch_done = done
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            LOGGER(__name__).error(f"Pipeline upload error: {e}")
-            failed += 1
-            done += 1
 
     try:
         await asyncio.gather(producer(), consumer())
     except asyncio.CancelledError:
         stop_signal.set()
+        # Cancel any in-flight downloads
+        for t in pending_downloads:
+            if not t.done():
+                t.cancel()
         raise
 
     # Final summary
