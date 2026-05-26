@@ -18,6 +18,8 @@ class Database:
             "session": None,
             "api_id": None,
             "api_hash": None,
+            "destination": None,    # NEW: target chat for downloads
+            "dest_label": None,     # human-readable label
         })
 
     async def delete_user(self, user_id: int):
@@ -29,6 +31,7 @@ class Database:
     async def get_all_users(self):
         return self.users.find({})
 
+    # ── Session ────────────────────────────────────────────────────────────────
     async def set_session(self, user_id: int, session):
         await self.users.update_one({"id": user_id}, {"$set": {"session": session}})
 
@@ -36,6 +39,7 @@ class Database:
         doc = await self.users.find_one({"id": user_id})
         return doc.get("session") if doc else None
 
+    # ── API ────────────────────────────────────────────────────────────────────
     async def set_api_id(self, user_id: int, api_id: int):
         await self.users.update_one({"id": user_id}, {"$set": {"api_id": api_id}})
 
@@ -50,5 +54,15 @@ class Database:
         doc = await self.users.find_one({"id": user_id})
         return doc.get("api_hash") if doc else None
 
+    # ── Destination ────────────────────────────────────────────────────────────
+    async def set_destination(self, user_id: int, dest, label: str = None):
+        await self.users.update_one(
+            {"id": user_id},
+            {"$set": {"destination": dest, "dest_label": label}}
+        )
 
-db = Database(DB_URI, DB_NAME)
+    async def get_destination(self, user_id: int):
+        doc = await self.users.find_one({"id": user_id})
+        if not doc:
+            return None, None
+        return doc.get("destination"), doc.get("dest_label")
