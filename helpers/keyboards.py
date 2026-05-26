@@ -1,40 +1,18 @@
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-def kb_start_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📥 Single Post", callback_data="mode_single"),
-            InlineKeyboardButton("📦 Batch Range", callback_data="mode_batch"),
-        ],
-        [
-            InlineKeyboardButton("🎵 Playlist", callback_data="mode_playlist"),
-        ],
-    ])
-
-
-def kb_confirm_cancel(action: str):
-    """Generic confirm / cancel pair."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_{action}"),
-            InlineKeyboardButton("❌ Cancel",  callback_data="cancel_task"),
-        ]
-    ])
-
-
 def kb_cancel_only():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_task")]
     ])
 
 
-def kb_caption(msg_id: int):
+def kb_destination_menu():
+    """Choose where to send downloads."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✂️ Trim Last Line", callback_data=f"cap_rmlast_{msg_id}"),
-            InlineKeyboardButton("▶️ Start",           callback_data=f"cap_done_{msg_id}"),
-        ]
+        [InlineKeyboardButton("📥 Send to this chat (bot)", callback_data="dest_here")],
+        [InlineKeyboardButton("📤 Send to another chat",    callback_data="dest_set")],
+        [InlineKeyboardButton("ℹ️ How to set channel/group", callback_data="dest_help")],
     ])
 
 
