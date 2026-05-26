@@ -35,6 +35,7 @@ from helpers.files import (
 )
 from helpers.msg import get_parsed_msg, clean_caption, apply_caption_rules, get_file_name
 from helpers.keyboards import kb_cancel_only
+from helpers.floodwait import floodwait_guard, handle_floodwait
 
 
 # ── Task registry ─────────────────────────────────────────────────────────────
@@ -243,7 +244,7 @@ async def try_copy_message(acc: Client, msg, target_chat_id, topic_id):
     except ChatForwardsRestricted:
         return False
     except FloodWait as e:
-        await asyncio.sleep(int(e.value) + 1)
+        await handle_floodwait(e, target_chat_id, floodwait_guard)
         return await try_copy_message(acc, msg, target_chat_id, topic_id)
     except Exception as e:
         LOGGER(__name__).warning(f"copy_message failed for {msg.id}: {e}")
@@ -301,7 +302,7 @@ async def send_file(
             await bot.send_document(document=media_source, **kwargs)
         return True
     except FloodWait as e:
-        await asyncio.sleep(int(e.value) + 1)
+        await handle_floodwait(e, chat_id, floodwait_guard)
         # On retry, reset BytesIO position
         if is_inmem:
             media_source.seek(0)
@@ -424,7 +425,7 @@ async def download_msg(
                     media_path=path,
                 )
         except FloodWait as e:
-            await asyncio.sleep(int(e.value) + 1)
+            await handle_floodwait(e, msg.chat.id if msg.chat else None, floodwait_guard)
         except FileReferenceExpired:
             return "ref_expired"
         except Exception as e:
@@ -553,7 +554,7 @@ async def process_media_group(
                 reply_to_message_id=topic_id,
             )
         except FloodWait as e:
-            await asyncio.sleep(int(e.value) + 1)
+            await handle_floodwait(e, target_chat_id, floodwait_guard)
         except Exception as e:
             LOGGER(__name__).error(f"Media group send failed: {e}")
 
@@ -571,6 +572,11 @@ async def run_batch(
     caption_rules=None,
     job_label: str = "",
     user_id: int = 0,
+    batch_id: str = None,           # NEW: resumable batch ID
+    resume_from: int = None,         # NEW: skip ahead on resume
+    job_index: int = 0,              # NEW: which job in playlist
+    total_jobs: int = 1,             # NEW: total jobs in playlist
+    progress_callback=None,          # NEW: per-message persist callback
 ):
     total = end_id - start_id + 1
     done = skipped = failed = success = 0
@@ -582,13 +588,31 @@ async def run_batch(
     )
     progress = ProgressTracker(status_msg, job_label, 0, total)
 
+    # ── Resume support: skip ahead if requested ──────────────────────────────
+    actual_start_id = max(start_id, resume_from) if resume_from else start_id
+    if actual_start_id > start_id:
+        already_done = actual_start_id - start_id
+        done = already_done
+        success = already_done
+        progress.batch_done = done
+        try:
+            await status_msg.edit(
+                f"<b>📦 {job_label}</b>\n"
+                f"<b>Resuming from message {actual_start_id}</b>\n"
+                f"<code>{done}/{total}</code>",
+                reply_markup=kb_cancel_only(),
+            )
+        except Exception:
+            pass
+
     # Try fast path: server-side copy (unrestricted source, no caption rules)
     if not caption_rules:
         if not await is_chat_restricted(acc, chat_id):
             return await _run_batch_fastpath(
                 acc, status_msg, progress,
-                chat_id, start_id, end_id,
+                chat_id, actual_start_id, end_id,
                 target_chat_id, topic_id, total, job_label,
+                user_id=user_id, batch_id=batch_id, progress_callback=progress_callback,
             )
 
     # ── Pipelined download → upload ───────────────────────────────────────────
@@ -622,6 +646,16 @@ async def run_batch(
                 failed += 1
                 done += 1
             progress.batch_done = done
+            # Persist progress for resume
+            if progress_callback:
+                current_id = (msg.id if msg else (actual_start_id + done - 1))
+                try:
+                    await progress_callback(
+                        job_index, current_id,
+                        done, success, skipped, failed,
+                    )
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -645,7 +679,7 @@ async def run_batch(
 
     async def producer():
         """Fetch messages and feed downloads into the pipeline."""
-        current = start_id
+        current = actual_start_id
 
         while current <= end_id and not stop_signal.is_set():
             chunk_end = min(current + 199, end_id)
@@ -738,6 +772,7 @@ async def _run_batch_fastpath(
     acc, status_msg, progress,
     chat_id, start_id, end_id, target_chat_id, topic_id,
     total, job_label,
+    user_id: int = 0, batch_id: str = None, progress_callback=None,
 ):
     """Fast path: source chat is unrestricted, use server-side copy for all."""
     done = skipped = failed = success = 0
@@ -777,6 +812,11 @@ async def _run_batch_fastpath(
 
             progress.batch_done = done
             await progress.update(0, 0)
+            if progress_callback:
+                try:
+                    await progress_callback(0, msg.id, done, success, skipped, failed)
+                except Exception:
+                    pass
             await asyncio.sleep(0.5)  # lighter throttle for fast path
 
         current = chunk_end + 1
