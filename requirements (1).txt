@@ -1,0 +1,6 @@
+pyrofork
+tgcrypto
+motor
+aiohttp
+psutil
+uvloop
