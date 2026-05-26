@@ -615,13 +615,17 @@ async def run_batch(
                 user_id=user_id, batch_id=batch_id, progress_callback=progress_callback,
             )
 
-    # ── Pipelined download → upload ───────────────────────────────────────────
-    # Up to PARALLEL_FILES downloads run in parallel; uploads happen as items finish.
+    # ── Ordered pipeline: downloads parallel, uploads strictly in source order ─
+    # Each item gets a sequence number. The consumer waits for seq N before
+    # uploading, even if N+1, N+2 finished first.
 
-    upload_queue: asyncio.Queue = asyncio.Queue()
     download_sem = asyncio.Semaphore(PARALLEL_FILES)
     stop_signal = asyncio.Event()
-    pending_downloads: list = []  # Track all spawned download tasks
+    pending_downloads: list = []           # all spawned download tasks
+    results: dict = {}                      # seq_no -> (result, msg)
+    results_lock = asyncio.Lock()
+    next_seq_ready = asyncio.Event()        # signalled whenever new result lands
+    producer_done = asyncio.Event()
 
     async def _handle_result(result, msg):
         nonlocal done, skipped, failed, success
@@ -646,7 +650,6 @@ async def run_batch(
                 failed += 1
                 done += 1
             progress.batch_done = done
-            # Persist progress for resume
             if progress_callback:
                 current_id = (msg.id if msg else (actual_start_id + done - 1))
                 try:
@@ -663,22 +666,25 @@ async def run_batch(
             failed += 1
             done += 1
 
-    async def _dl_and_queue(m):
-        """Download a message, then push the result to the upload queue."""
+    async def _dl_and_store(seq, m):
+        """Download a message and stash the result at its sequence slot."""
         try:
             async with download_sem:
                 if stop_signal.is_set():
                     return
                 result = await download_msg(acc, m, caption_rules, user_id, progress)
-            await upload_queue.put((result, m))
         except asyncio.CancelledError:
             raise
         except Exception as e:
             LOGGER(__name__).error(f"Download task error msg {m.id}: {e}")
-            await upload_queue.put(("error", m))
+            result = "error"
+        async with results_lock:
+            results[seq] = (result, m)
+            next_seq_ready.set()
 
     async def producer():
-        """Fetch messages and feed downloads into the pipeline."""
+        """Fetch messages and dispatch downloads. Assigns strict sequence numbers."""
+        seq = 0
         current = actual_start_id
 
         while current <= end_id and not stop_signal.is_set():
@@ -699,56 +705,93 @@ async def run_batch(
                     return
 
                 if not msg or msg.empty:
-                    await upload_queue.put(("skip", None))
+                    async with results_lock:
+                        results[seq] = ("skip", None)
+                        next_seq_ready.set()
+                    seq += 1
                     continue
 
-                # Skip duplicate media groups
                 if msg.media_group_id:
                     if msg.media_group_id in processed_groups:
-                        await upload_queue.put(("skip", None))
+                        async with results_lock:
+                            results[seq] = ("skip", None)
+                            next_seq_ready.set()
+                        seq += 1
                         continue
                     processed_groups.add(msg.media_group_id)
 
-                # Simple cases (text, media group) bypass the download pipeline.
-                # process_simple actually sends the message inline; just queue a result.
-                simple_result = await process_simple(
-                    bot, acc, msg, target_chat_id, topic_id, caption_rules, progress,
-                )
-                if simple_result is not None:
-                    await upload_queue.put((simple_result, None))
+                # Simple cases (text, media group): wait for current seq before
+                # sending — otherwise text would jump ahead of pending downloads.
+                # We mark these as a special "synchronous" result and let the
+                # consumer execute them in order.
+                if not bool(msg.document or msg.video or msg.audio or msg.photo
+                            or msg.animation or msg.voice or msg.video_note
+                            or msg.sticker or msg.media_group_id):
+                    # Pure text — process via process_simple in the consumer's turn
+                    pass
+
+                if msg.media_group_id or not bool(
+                    msg.document or msg.video or msg.audio or msg.photo
+                    or msg.animation or msg.voice or msg.video_note or msg.sticker
+                ):
+                    # Defer text/group send to the consumer to keep ordering
+                    async with results_lock:
+                        results[seq] = (("__simple__", msg), msg)
+                        next_seq_ready.set()
+                    seq += 1
                     continue
 
-                # Throttle the producer if too many downloads are queued
-                # (prevents memory blowup with very large batches)
+                # Throttle producer if too many in-flight downloads
                 while len(pending_downloads) - sum(1 for t in pending_downloads if t.done()) >= PARALLEL_FILES + 1:
                     await asyncio.sleep(0.5)
 
-                # Spawn the download — TRACKED in pending_downloads
-                task = asyncio.create_task(_dl_and_queue(msg))
+                task = asyncio.create_task(_dl_and_store(seq, msg))
                 pending_downloads.append(task)
+                seq += 1
 
                 await asyncio.sleep(WAITING_TIME)
 
             current = chunk_end + 1
 
-        # All messages fetched. Wait for all downloads to finish, THEN signal end.
+        # Wait for all downloads, then signal end
         if pending_downloads:
             await asyncio.gather(*pending_downloads, return_exceptions=True)
-        await upload_queue.put(("__END__", None))
+        producer_done.set()
+        next_seq_ready.set()  # wake the consumer
 
     async def consumer():
-        """Upload completed downloads as they arrive."""
+        """Upload completed downloads strictly in seq order."""
+        seq = 0
         while True:
-            result, msg = await upload_queue.get()
-            if result == "__END__":
-                return
-            await _handle_result(result, msg)
+            # Wait until results[seq] is available OR producer is done with no more coming
+            while True:
+                async with results_lock:
+                    if seq in results:
+                        result, msg = results.pop(seq)
+                        break
+                    if producer_done.is_set() and not pending_downloads_alive():
+                        return
+                    next_seq_ready.clear()
+                await next_seq_ready.wait()
+
+            # Handle deferred simple message (text/group) here, in order
+            if isinstance(result, tuple) and len(result) == 2 and result[0] == "__simple__":
+                simple_msg = result[1]
+                simple_result = await process_simple(
+                    bot, acc, simple_msg, target_chat_id, topic_id, caption_rules, progress,
+                )
+                await _handle_result(simple_result or "ok", simple_msg)
+            else:
+                await _handle_result(result, msg)
+            seq += 1
+
+    def pending_downloads_alive():
+        return any(not t.done() for t in pending_downloads)
 
     try:
         await asyncio.gather(producer(), consumer())
     except asyncio.CancelledError:
         stop_signal.set()
-        # Cancel any in-flight downloads
         for t in pending_downloads:
             if not t.done():
                 t.cancel()
