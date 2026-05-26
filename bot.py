@@ -35,6 +35,7 @@ async def run_health_server():
 # ── Bot ───────────────────────────────────────────────────────────────────────
 class AirSaverBot(Client):
     def __init__(self):
+        from config import MAX_TRANSMISSIONS
         super().__init__(
             "airsaver_bot",
             api_id=API_ID,
@@ -44,6 +45,7 @@ class AirSaverBot(Client):
             workers=200,
             sleep_threshold=10,
             in_memory=True,
+            max_concurrent_transmissions=MAX_TRANSMISSIONS,
         )
 
     async def start(self):
