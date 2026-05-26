@@ -25,20 +25,27 @@ async def start(client: Client, message: Message):
     status = "✅ Logged in" if session else "❌ Not logged in — use /login"
     dest_text = f"📤 **{dest_label}**" if dest else "📤 **This chat**"
 
+    # Check for resumable batches
+    paused = await db.get_active_batches(message.from_user.id)
+    paused_line = ""
+    if paused:
+        paused_line = f"\n\n🔁 You have **{len(paused)}** paused batch(es) — use /resume to continue."
+
     await message.reply(
         f"👋 **Hi {message.from_user.mention}!**\n\n"
         "I save restricted content from any Telegram channel or group — "
         "including **topic threads**, with **server-side fast copy** for "
         "unrestricted sources.\n\n"
         f"**Account:** {status}\n"
-        f"**Destination:** {dest_text}\n\n"
+        f"**Destination:** {dest_text}"
+        f"{paused_line}\n\n"
         "**Quick start:**\n"
         "• Send any post link → download it\n"
         "• `link1 - link2` → batch range\n"
         "• /playlist → send multiple links at once\n"
         "• /setchannel → send files to a channel/group\n"
+        "• /resume → continue paused batches\n"
         "• /cancel → stop your current task\n"
-        "• /status → check task status\n"
         "• /help → full help",
         disable_web_page_preview=True,
     )
@@ -67,7 +74,8 @@ async def help_cmd(client: Client, message: Message):
         "/destination — show current destination\n"
         "/resetdest — reset to this chat\n\n"
         "**Controls:**\n"
-        "/cancel — stop your task\n"
+        "/cancel — stop your task (progress saved!)\n"
+        "/resume — continue paused batches\n"
         "/status — check task status\n"
         "/login /logout — manage your account\n\n"
         "**Speed:**\n"
