@@ -796,10 +796,6 @@ async def run_batch(
                     seq += 1
                     continue
 
-                # Throttle producer: count only alive tasks (O(1) with pruning below)
-                while sum(1 for t in pending_downloads if not t.done()) >= PARALLEL_FILES + 1:
-                    await asyncio.sleep(0.2)
-
                 task = asyncio.create_task(_dl_and_store(seq, msg))
                 pending_downloads.append(task)
                 seq += 1
@@ -910,10 +906,25 @@ async def _run_batch_fastpath(
     _forwards_restricted = False   # once True, stay in concurrent-copy mode
     _drop_author_ok: list = [None]  # [None]=unknown, [True]=supported, [False]=not
 
-    _FWCHUNK = 100             # Telegram hard limit: 100 IDs per forward_messages
-    _copy_sem = asyncio.Semaphore(8)  # parallel copy_message in fallback mode
+    _FWCHUNK = 100              # Telegram hard limit: 100 IDs per forward_messages
+    _copy_sem = asyncio.Semaphore(16)  # parallel copy_message in fallback mode
 
     progress.set_file("Server-side copy", "⚡ Fast forwarding", extra="no transfer needed")
+
+    async def _fetch_chunk(ids: list):
+        """Fetch a message chunk; returns list (may be empty on error)."""
+        for _retry in range(3):
+            try:
+                msgs = await asyncio.wait_for(
+                    acc.get_messages(chat_id=chat_id, message_ids=ids),
+                    timeout=90,
+                )
+                return msgs if isinstance(msgs, list) else [msgs]
+            except asyncio.TimeoutError:
+                await asyncio.sleep(5)
+            except Exception:
+                break
+        return []
 
     async def _bulk_forward(msg_list: list):
         nonlocal success, failed, done, _forwards_restricted
@@ -975,27 +986,24 @@ async def _run_batch_fastpath(
         if msg_list:
             await asyncio.gather(*[_copy_one(m) for m in msg_list])
 
-    current = start_id
-    while current <= end_id:
-        chunk_end = min(current + 199, end_id)
-        chunk_ids = list(range(current, chunk_end + 1))
+    # Pipelined chunk fetching: fetch chunk N+1 while processing chunk N.
+    # Hides get_messages network latency (~100 ms × num_chunks).
+    def _next_chunk_ids(from_id):
+        if from_id > end_id:
+            return None, None
+        to_id = min(from_id + 199, end_id)
+        return list(range(from_id, to_id + 1)), to_id
 
-        try:
-            msgs = await asyncio.wait_for(
-                acc.get_messages(chat_id=chat_id, message_ids=chunk_ids),
-                timeout=90,
-            )
-            if not isinstance(msgs, list):
-                msgs = [msgs]
-        except asyncio.TimeoutError:
-            LOGGER(__name__).warning(
-                f"get_messages timed out (fast path) chunk {current}-{chunk_end}, retrying"
-            )
-            await asyncio.sleep(5)
-            continue
-        except Exception:
-            current = chunk_end + 1
-            continue
+    current = start_id
+    cur_ids, cur_end = _next_chunk_ids(current)
+    prefetch = asyncio.create_task(_fetch_chunk(cur_ids)) if cur_ids else None
+
+    while prefetch is not None:
+        msgs = await prefetch
+
+        # Kick off the next fetch immediately (overlap with processing below)
+        nxt_ids, nxt_end = _next_chunk_ids(cur_end + 1)
+        prefetch = asyncio.create_task(_fetch_chunk(nxt_ids)) if nxt_ids else None
 
         # Separate real messages from empty / album duplicates
         real_msgs = []
@@ -1014,11 +1022,11 @@ async def _run_batch_fastpath(
 
         if real_msgs:
             if not _forwards_restricted:
-                # Bulk forward: 1 call per 100 messages
+                # Bulk forward: 1 API call per 100 messages
                 for i in range(0, len(real_msgs), _FWCHUNK):
                     await _bulk_forward(real_msgs[i:i + _FWCHUNK])
             else:
-                # Fallback: 8 concurrent copy_message calls
+                # Fallback: 16 concurrent copy_message calls
                 await _concurrent_copy(real_msgs)
 
         progress.batch_done = done
@@ -1026,11 +1034,11 @@ async def _run_batch_fastpath(
         if progress_callback:
             try:
                 skipped_total = skipped_empty + skipped_group
-                await progress_callback(0, chunk_end, done, success, skipped_total, failed)
+                await progress_callback(0, cur_end, done, success, skipped_total, failed)
             except Exception:
                 pass
 
-        current = chunk_end + 1
+        cur_end = nxt_end if nxt_end else cur_end
 
     try:
         skipped_total = skipped_empty + skipped_group

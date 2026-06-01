@@ -31,16 +31,13 @@ async def get_acc(bot: Client, message: Message):
         return TechVJUser
 
     user_id = message.from_user.id
-    session = await db.get_session(user_id)
+    session, api_id, api_hash = await db.get_user_session_data(user_id)
     if not session:
         await message.reply(
             "⚠️ You need to log in first.\n"
             "Use /login to authenticate with your Telegram account."
         )
         return None
-
-    api_id = await db.get_api_id(user_id)
-    api_hash = await db.get_api_hash(user_id)
     try:
         acc = Client(
             ":memory:", session_string=session,

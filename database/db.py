@@ -1,4 +1,5 @@
 import motor.motor_asyncio
+from pymongo import ASCENDING
 from time import time as ts
 from config import DB_URI, DB_NAME
 
@@ -8,11 +9,21 @@ class Database:
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self._client[db_name]
         self.users = self.db.users
-        self.batches = self.db.batches  # NEW: resumable batch state
+        self.batches = self.db.batches
+
+    async def ensure_indexes(self):
+        """Create indexes once on startup — no-op if they already exist."""
+        await self.users.create_index([("id", ASCENDING)], unique=True, background=True)
+        await self.batches.create_index(
+            [("user_id", ASCENDING), ("batch_id", ASCENDING)], unique=True, background=True
+        )
+        await self.batches.create_index(
+            [("user_id", ASCENDING), ("status", ASCENDING)], background=True
+        )
 
     # ── User CRUD ──────────────────────────────────────────────────────────────
     async def is_user_exist(self, user_id: int) -> bool:
-        return bool(await self.users.find_one({"id": user_id}))
+        return bool(await self.users.find_one({"id": user_id}, {"_id": 1}))
 
     async def add_user(self, user_id: int, name: str):
         await self.users.insert_one({
@@ -39,21 +50,30 @@ class Database:
         await self.users.update_one({"id": user_id}, {"$set": {"session": session}})
 
     async def get_session(self, user_id: int):
-        doc = await self.users.find_one({"id": user_id})
+        doc = await self.users.find_one({"id": user_id}, {"session": 1})
         return doc.get("session") if doc else None
+
+    async def get_user_session_data(self, user_id: int):
+        """Return (session, api_id, api_hash) in one round-trip."""
+        doc = await self.users.find_one(
+            {"id": user_id}, {"session": 1, "api_id": 1, "api_hash": 1}
+        )
+        if not doc:
+            return None, None, None
+        return doc.get("session"), doc.get("api_id"), doc.get("api_hash")
 
     async def set_api_id(self, user_id: int, api_id: int):
         await self.users.update_one({"id": user_id}, {"$set": {"api_id": api_id}})
 
     async def get_api_id(self, user_id: int):
-        doc = await self.users.find_one({"id": user_id})
+        doc = await self.users.find_one({"id": user_id}, {"api_id": 1})
         return doc.get("api_id") if doc else None
 
     async def set_api_hash(self, user_id: int, api_hash: str):
         await self.users.update_one({"id": user_id}, {"$set": {"api_hash": api_hash}})
 
     async def get_api_hash(self, user_id: int):
-        doc = await self.users.find_one({"id": user_id})
+        doc = await self.users.find_one({"id": user_id}, {"api_hash": 1})
         return doc.get("api_hash") if doc else None
 
     # ── Destination ────────────────────────────────────────────────────────────
@@ -64,7 +84,7 @@ class Database:
         )
 
     async def get_destination(self, user_id: int):
-        doc = await self.users.find_one({"id": user_id})
+        doc = await self.users.find_one({"id": user_id}, {"destination": 1, "dest_label": 1})
         if not doc:
             return None, None
         return doc.get("destination"), doc.get("dest_label")

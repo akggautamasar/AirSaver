@@ -92,6 +92,8 @@ if __name__ == "__main__":
                 pass
 
     async def main():
+        from database.db import db
+        await db.ensure_indexes()
         await run_health_server()
 
         if TechVJUser is not None:
