@@ -13,7 +13,7 @@ from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 
 from config import LOGIN_SYSTEM, MAX_TRANSMISSIONS
 from database.db import db
-from helpers.msg import parse_range_input, parse_playlist_input
+from helpers.msg import parse_range_input, parse_playlist_input, parse_channel_link
 from helpers.keyboards import kb_cancel_only
 from helpers.downloader import (
     run_batch, register_task, cancel_task, has_running_task,
@@ -208,6 +208,95 @@ async def _resume_batch(bot: Client, message: Message, batch: dict):
     register_task(user_id, asyncio.create_task(_run()))
 
 
+# ── /clone ───────────────────────────────────────────────────────────────────
+@Client.on_message(filters.private & filters.command("clone"))
+async def cmd_clone(bot: Client, message: Message):
+    if has_running_task(message.from_user.id):
+        return await message.reply("⚠️ You already have a running task. Use /cancel first.")
+
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        return await message.reply(
+            "<b>📋 Clone Channel / Group</b>\n\n"
+            "Copies every message from a channel or group to your destination.\n\n"
+            "<b>Usage:</b>\n"
+            "<code>/clone https://t.me/channelname</code>\n"
+            "<code>/clone https://t.me/c/1234567890</code>\n"
+            "<code>/clone @channelname</code>\n\n"
+            "Set a destination first with /setchannel."
+        )
+
+    source = args[1].strip()
+
+    # Parse the channel identifier
+    try:
+        chat_ref, topic_id = parse_channel_link(source)
+    except ValueError as e:
+        return await message.reply(f"❌ {e}")
+
+    acc = await get_acc(bot, message)
+    if not acc:
+        return
+
+    status = await message.reply("🔍 <b>Resolving channel…</b>")
+
+    # Resolve and verify access
+    try:
+        chat = await acc.get_chat(chat_ref)
+    except Exception as e:
+        await status.edit(
+            f"❌ <b>Could not access the chat.</b>\n"
+            f"<i>{e}</i>\n\n"
+            "Make sure your account is a member of that channel/group."
+        )
+        await _disconnect_if_needed(acc)
+        return
+
+    chat_name = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat.id)
+
+    # Find the latest message ID
+    last_id = None
+    try:
+        async for msg in acc.get_chat_history(chat.id, limit=1):
+            last_id = msg.id
+    except Exception as e:
+        await status.edit(f"❌ Could not fetch message history: <i>{e}</i>")
+        await _disconnect_if_needed(acc)
+        return
+
+    if not last_id:
+        await status.edit("❌ The channel appears to be empty or inaccessible.")
+        await _disconnect_if_needed(acc)
+        return
+
+    # Find the first real message ID to avoid scanning from 1 needlessly
+    first_id = 1
+    try:
+        async for msg in acc.get_chat_history(chat.id, limit=1, reverse=True):
+            first_id = msg.id
+    except Exception:
+        first_id = 1
+
+    total_slots = last_id - first_id + 1
+    target_chat, target_label = await _get_target(message)
+
+    await status.edit(
+        f"<b>📋 Clone: {chat_name}</b>\n\n"
+        f"📨 Message range: <code>{first_id}</code> → <code>{last_id}</code> "
+        f"(~{total_slots} slots)\n"
+        f"📤 Destination: <b>{target_label or 'this chat'}</b>\n\n"
+        "<b>Starting clone…</b>"
+    )
+
+    jobs = [(chat.id, first_id, last_id, topic_id)]
+    label = f"Clone: {chat_name[:40]}"
+
+    await _kick_off_jobs(
+        bot, message, jobs, label,
+        _acc=acc, _target=(target_chat, target_label),
+    )
+
+
 # ── /batch ────────────────────────────────────────────────────────────────────
 @Client.on_message(filters.private & filters.command("batch"))
 async def cmd_batch(bot: Client, message: Message):
@@ -253,7 +342,7 @@ async def cmd_playlist(bot: Client, message: Message):
     filters.private & filters.text & ~filters.forwarded
     & ~filters.command([
         "start", "help", "login", "logout", "cancel", "resume",
-        "status", "batch", "playlist", "logs", "stats", "broadcast",
+        "status", "batch", "playlist", "clone", "logs", "stats", "broadcast",
         "setchannel", "destination", "resetdest",
     ])
 )
@@ -287,18 +376,25 @@ async def handle_text(bot: Client, message: Message):
     await _kick_off_jobs(bot, message, jobs, label_kind)
 
 
-async def _kick_off_jobs(bot: Client, message: Message, jobs: list, label_kind: str):
-    """Persist batch state and start the task."""
+async def _kick_off_jobs(
+    bot: Client, message: Message, jobs: list, label_kind: str,
+    _acc=None, _target=None,
+):
+    """Persist batch state and start the task.
+
+    _acc: pre-connected user client (skips get_acc call).
+    _target: (target_chat_id, target_label) tuple (skips DB lookup).
+    """
     user_id = message.from_user.id
 
     if has_running_task(user_id):
         return await message.reply("⚠️ Already running. Use /cancel first.")
 
-    acc = await get_acc(bot, message)
+    acc = _acc or await get_acc(bot, message)
     if not acc:
         return
 
-    target_chat, target_label = await _get_target(message)
+    target_chat, target_label = _target if _target else await _get_target(message)
 
     # ── Persist initial batch state ───────────────────────────────────────────
     batch_id = str(uuid.uuid4())[:12]

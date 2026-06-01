@@ -129,7 +129,52 @@ def parse_playlist_input(text: str):
     return jobs, errors
 
 
-async def get_parsed_msg(chat_msg) -> str:
+def parse_channel_link(text: str):
+    """
+    Parse a channel/group reference (not a specific message link).
+
+    Accepts:
+      https://t.me/username
+      https://t.me/c/1234567890
+      https://t.me/+invitehash
+      @username
+      username
+
+    Returns (chat_id, topic_id).  topic_id is None for full-channel clone.
+    chat_id is a str username or a negative int for private channels.
+    """
+    text = text.strip().rstrip("/")
+    if "?" in text:
+        text = text.split("?")[0]
+
+    if text.startswith("@"):
+        return text, None
+
+    if "t.me/" in text.lower():
+        after = text.split("t.me/", 1)[1]
+        segments = [s for s in after.split("/") if s]
+        if not segments:
+            raise ValueError("Could not parse channel link — path is empty.")
+        first = segments[0]
+        if first.startswith("+"):
+            # Invite link — return as-is; caller must join before fetching history
+            return text, None
+        if first == "c":
+            if len(segments) < 2:
+                raise ValueError("Private channel link requires a channel ID after /c/.")
+            chat_id = get_channel_id(int(segments[1]))
+            return chat_id, None
+        # Public channel: t.me/username[/anything...]
+        return first, None
+
+    # Plain username (no @, no t.me)
+    if re.match(r'^[a-zA-Z][a-zA-Z0-9_]{3,}$', text):
+        return text, None
+
+    raise ValueError(f"Cannot parse channel identifier: {text!r}")
+
+
+
     if chat_msg.caption:
         return chat_msg.caption.html
     elif chat_msg.text:
