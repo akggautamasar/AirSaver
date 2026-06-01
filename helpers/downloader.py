@@ -894,11 +894,86 @@ async def _run_batch_fastpath(
     total, job_label,
     user_id: int = 0, batch_id: str = None, progress_callback=None,
 ):
-    """Fast path: source chat is unrestricted, use server-side copy for all."""
+    """Fast path: server-side transfer for unrestricted sources.
+
+    Speed strategy (tried in order):
+      1. forward_messages(ids=[...100...])  — 1 API call per 100 msgs (~100x faster
+         than per-message copy). Uses drop_author=True so destination receives
+         clean messages with no 'Forwarded from' header.
+         ↓ if ChatForwardsRestricted
+      2. 8 concurrent copy_message calls   — still server-side, no download/upload,
+         ~8x faster than the old sequential copy.
+    """
     done = failed = success = 0
     skipped_empty = skipped_group = 0
     processed_groups: set = set()
+    _forwards_restricted = False   # once True, stay in concurrent-copy mode
+    _drop_author_ok: list = [None]  # [None]=unknown, [True]=supported, [False]=not
+
+    _FWCHUNK = 100             # Telegram hard limit: 100 IDs per forward_messages
+    _copy_sem = asyncio.Semaphore(8)  # parallel copy_message in fallback mode
+
     progress.set_file("Server-side copy", "⚡ Fast forwarding", extra="no transfer needed")
+
+    async def _bulk_forward(msg_list: list):
+        nonlocal success, failed, done, _forwards_restricted
+        if not msg_list:
+            return
+        ids = [m.id for m in msg_list]
+        for attempt in range(5):
+            try:
+                kw = dict(
+                    chat_id=target_chat_id,
+                    from_chat_id=chat_id,
+                    message_ids=ids,
+                )
+                if topic_id:
+                    kw["message_thread_id"] = topic_id
+
+                # Try drop_author=True (removes "Forwarded from" header) —
+                # supported in pyrofork; gracefully degrade if not.
+                if _drop_author_ok[0] is False:
+                    await acc.forward_messages(**kw)
+                else:
+                    try:
+                        await acc.forward_messages(**kw, drop_author=True)
+                        _drop_author_ok[0] = True
+                    except TypeError:
+                        _drop_author_ok[0] = False
+                        await acc.forward_messages(**kw)
+
+                success += len(msg_list)
+                done += len(msg_list)
+                return
+            except ChatForwardsRestricted:
+                _forwards_restricted = True
+                await _concurrent_copy(msg_list)
+                return
+            except FloodWait as e:
+                await handle_floodwait(e, target_chat_id, floodwait_guard)
+            except Exception as e:
+                LOGGER(__name__).warning(f"forward_messages failed attempt {attempt+1}: {e}")
+                if attempt >= 4:
+                    failed += len(msg_list)
+                    done += len(msg_list)
+                    return
+                await asyncio.sleep(2)
+        failed += len(msg_list)
+        done += len(msg_list)
+
+    async def _copy_one(m):
+        nonlocal success, failed, done
+        async with _copy_sem:
+            ok = await try_copy_message(acc, m, target_chat_id, topic_id)
+        if ok:
+            success += 1
+        else:
+            failed += 1
+        done += 1
+
+    async def _concurrent_copy(msg_list: list):
+        if msg_list:
+            await asyncio.gather(*[_copy_one(m) for m in msg_list])
 
     current = start_id
     while current <= end_id:
@@ -913,13 +988,17 @@ async def _run_batch_fastpath(
             if not isinstance(msgs, list):
                 msgs = [msgs]
         except asyncio.TimeoutError:
-            LOGGER(__name__).warning(f"get_messages timed out (fast path) chunk {current}-{chunk_end}, retrying")
+            LOGGER(__name__).warning(
+                f"get_messages timed out (fast path) chunk {current}-{chunk_end}, retrying"
+            )
             await asyncio.sleep(5)
             continue
         except Exception:
             current = chunk_end + 1
             continue
 
+        # Separate real messages from empty / album duplicates
+        real_msgs = []
         for msg in msgs:
             if not msg or msg.empty:
                 skipped_empty += 1
@@ -931,21 +1010,25 @@ async def _run_batch_fastpath(
                     done += 1
                     continue
                 processed_groups.add(msg.media_group_id)
+            real_msgs.append(msg)
 
-            if await try_copy_message(acc, msg, target_chat_id, topic_id):
-                success += 1
+        if real_msgs:
+            if not _forwards_restricted:
+                # Bulk forward: 1 call per 100 messages
+                for i in range(0, len(real_msgs), _FWCHUNK):
+                    await _bulk_forward(real_msgs[i:i + _FWCHUNK])
             else:
-                failed += 1
-            done += 1
+                # Fallback: 8 concurrent copy_message calls
+                await _concurrent_copy(real_msgs)
 
-            progress.batch_done = done
-            await progress.update(0, 0)
-            if progress_callback:
-                try:
-                    skipped_total = skipped_empty + skipped_group
-                    await progress_callback(0, msg.id, done, success, skipped_total, failed)
-                except Exception:
-                    pass
+        progress.batch_done = done
+        await progress.update(0, 0)
+        if progress_callback:
+            try:
+                skipped_total = skipped_empty + skipped_group
+                await progress_callback(0, chunk_end, done, success, skipped_total, failed)
+            except Exception:
+                pass
 
         current = chunk_end + 1
 
@@ -959,8 +1042,9 @@ async def _run_batch_fastpath(
         skip_str = f"<b>{skipped_total}</b>"
         if skip_detail:
             skip_str += f" <i>({', '.join(skip_detail)})</i>"
+        mode = "Copy" if _forwards_restricted else "Forward"
         await status_msg.edit(
-            f"<blockquote>⚡ <b>{job_label or 'Batch'} Complete (Fast)!</b>\n"
+            f"<blockquote>⚡ <b>{job_label or 'Batch'} Complete (Fast/{mode})!</b>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"✔️ Sent: <b>{success}</b>\n"
             f"⏭ Skipped: {skip_str}\n"
