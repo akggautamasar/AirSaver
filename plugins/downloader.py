@@ -217,12 +217,20 @@ async def cmd_clone(bot: Client, message: Message):
     args = message.text.split(None, 1)
     if len(args) < 2:
         return await message.reply(
-            "<b>📋 Clone Channel / Group</b>\n\n"
-            "Copies every message from a channel or group to your destination.\n\n"
-            "<b>Usage:</b>\n"
+            "<b>📋 Clone Channel / Group / Topic</b>\n\n"
+            "Copies every message from a channel, group, or topic thread "
+            "to your destination.\n\n"
+            "<b>Clone entire channel or group:</b>\n"
             "<code>/clone https://t.me/channelname</code>\n"
             "<code>/clone https://t.me/c/1234567890</code>\n"
             "<code>/clone @channelname</code>\n\n"
+            "<b>Clone a specific topic thread only:</b>\n"
+            "<code>/clone https://t.me/c/1234567890/5/1</code>\n"
+            "<code>/clone https://t.me/groupname/5/1</code>\n"
+            "<i>(the number after the group ID is the topic ID)</i>\n\n"
+            "<b>Don't know the ID?</b>\n"
+            "Forward any message from the group to me — "
+            "I'll show you the exact command.\n\n"
             "Set a destination first with /setchannel."
         )
 
@@ -280,8 +288,10 @@ async def cmd_clone(bot: Client, message: Message):
     total_slots = last_id - first_id + 1
     target_chat, target_label = await _get_target(message)
 
+    topic_line = f"📌 Topic ID: <code>{topic_id}</code>\n" if topic_id else ""
     await status.edit(
         f"<b>📋 Clone: {chat_name}</b>\n\n"
+        f"{topic_line}"
         f"📨 Message range: <code>{first_id}</code> → <code>{last_id}</code> "
         f"(~{total_slots} slots)\n"
         f"📤 Destination: <b>{target_label or 'this chat'}</b>\n\n"
