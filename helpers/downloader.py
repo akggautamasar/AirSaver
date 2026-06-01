@@ -650,6 +650,8 @@ async def run_batch(
     results_lock = asyncio.Lock()
     next_seq_ready = asyncio.Event()        # signalled whenever new result lands
     producer_done = asyncio.Event()
+    dc_warmed = asyncio.Event()             # set after first media DC auth completes
+    warmup_lock = asyncio.Lock()            # serialize the very first download
 
     async def _handle_result(result, msg):
         nonlocal done, skipped_empty, skipped_group, skipped_size, failed, success
@@ -707,6 +709,23 @@ async def run_batch(
                         results[seq] = ("empty", m)
                         next_seq_ready.set()
                     return
+                # Warm-up gate: the first media download authorizes the media DC
+                # alone. Firing several "cold" downloads at once makes them race
+                # on auth.ImportAuthorization → AUTH_BYTES_INVALID. Once one has
+                # finished (auth cached), the rest run fully in parallel.
+                if not dc_warmed.is_set():
+                    async with warmup_lock:
+                        if not dc_warmed.is_set():
+                            try:
+                                result = await download_msg(
+                                    acc, m, caption_rules, user_id, progress
+                                )
+                            finally:
+                                dc_warmed.set()
+                            async with results_lock:
+                                results[seq] = (result, m)
+                                next_seq_ready.set()
+                            return
                 result = await download_msg(acc, m, caption_rules, user_id, progress)
         except asyncio.CancelledError:
             # Always store a result so consumer doesn't deadlock
