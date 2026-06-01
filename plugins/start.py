@@ -91,7 +91,37 @@ async def help_cmd(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.private & filters.command("stats"))
+@Client.on_message(filters.private & filters.forwarded)
+async def handle_forwarded(client: Client, message: Message):
+    """Reply with chat ID + ready /clone command when user forwards a message."""
+    chat = getattr(message, "forward_from_chat", None)
+    if not chat:
+        # Forwarded from a user, not a channel/group — ignore silently
+        return
+
+    chat_id = chat.id
+    chat_name = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat_id)
+
+    # Build a usable reference for /clone
+    if chat.username:
+        clone_ref = f"https://t.me/{chat.username}"
+    elif str(chat_id).startswith("-100"):
+        raw_id = str(chat_id)[4:]   # strip the -100 prefix
+        clone_ref = f"https://t.me/c/{raw_id}"
+    else:
+        clone_ref = str(chat_id)
+
+    await message.reply(
+        f"<b>📋 Chat identified</b>\n\n"
+        f"<b>Name:</b> {chat_name}\n"
+        f"<b>ID:</b> <code>{chat_id}</code>\n\n"
+        f"<b>Clone this chat:</b>\n"
+        f"<code>/clone {clone_ref}</code>",
+        quote=True,
+    )
+
+
+
 async def stats(client: Client, message: Message):
     uptime = get_readable_time(time() - BOT_START_TIME)
     total_users = await db.total_users_count()
