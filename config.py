@@ -21,6 +21,6 @@ MAX_TRANSMISSIONS = int(os.environ.get("MAX_TRANSMISSIONS", "20"))
 ERROR_MESSAGE     = os.environ.get("ERROR_MESSAGE", "True").lower() != "false"
 
 # ── Phase 2 & 3 ───────────────────────────────────────────────────────────────
-PARALLEL_FILES    = int(os.environ.get("PARALLEL_FILES", "4"))      # 4 parallel downloads
+PARALLEL_FILES    = int(os.environ.get("PARALLEL_FILES", "2"))      # 2 parallel downloads (avoids DC auth race)
 INMEM_THRESHOLD   = int(os.environ.get("INMEM_THRESHOLD", "209715200"))  # 200 MB
 PIPELINE_DEPTH    = int(os.environ.get("PIPELINE_DEPTH", "2"))      # Phase 3: lookahead size

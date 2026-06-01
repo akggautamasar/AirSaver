@@ -21,7 +21,7 @@ from pyrogram.types import (
 )
 from pyrogram.errors import (
     FloodWait, FileReferenceExpired, PeerIdInvalid,
-    BadRequest, ChatForwardsRestricted,
+    BadRequest, ChatForwardsRestricted, AuthBytesInvalid,
 )
 
 from config import (
@@ -407,7 +407,7 @@ async def download_msg(
     # 10 min timeout per file; large files (>200 MB on disk) get 30 min
     dl_timeout = 1800 if not use_inmem else 600
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             if use_inmem:
                 buf = await asyncio.wait_for(
@@ -434,15 +434,22 @@ async def download_msg(
                 )
         except asyncio.TimeoutError:
             LOGGER(__name__).warning(f"Download timed out for msg {msg.id}, attempt {attempt+1}")
-            if attempt == 2:
+            if attempt >= 4:
                 return "error"
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
+        except AuthBytesInvalid:
+            # DC auth collision: two parallel downloads raced to ImportAuthorization.
+            # Wait for the winner to finish, then retry — subsequent attempt succeeds.
+            LOGGER(__name__).warning(f"AUTH_BYTES_INVALID for msg {msg.id}, retry {attempt+1}/5")
+            if attempt >= 4:
+                return "error"
+            await asyncio.sleep(3 + attempt * 2)
         except FloodWait as e:
             await handle_floodwait(e, msg.chat.id if msg.chat else None, floodwait_guard)
         except FileReferenceExpired:
             return "ref_expired"
         except Exception as e:
-            if attempt == 2:
+            if attempt >= 4:
                 LOGGER(__name__).error(f"Download failed msg {msg.id}: {e}")
                 return "error"
             await asyncio.sleep(2)
@@ -592,7 +599,8 @@ async def run_batch(
     progress_callback=None,          # NEW: per-message persist callback
 ):
     total = end_id - start_id + 1
-    done = skipped = failed = success = 0
+    done = failed = success = 0
+    skipped_empty = skipped_group = skipped_size = 0
     processed_groups: set = set()
 
     status_msg = await origin_msg.reply(
@@ -607,6 +615,9 @@ async def run_batch(
         already_done = actual_start_id - start_id
         done = already_done
         success = already_done
+        skipped_empty = 0
+        skipped_group = 0
+        skipped_size = 0
         progress.batch_done = done
         try:
             await status_msg.edit(
@@ -641,7 +652,7 @@ async def run_batch(
     producer_done = asyncio.Event()
 
     async def _handle_result(result, msg):
-        nonlocal done, skipped, failed, success
+        nonlocal done, skipped_empty, skipped_group, skipped_size, failed, success
         try:
             if isinstance(result, DownloadedItem):
                 ok = await upload_item(bot, result, target_chat_id, topic_id, progress)
@@ -653,8 +664,14 @@ async def run_batch(
             elif result == "ok":
                 success += 1
                 done += 1
-            elif result == "skip":
-                skipped += 1
+            elif result == "empty":
+                skipped_empty += 1
+                done += 1
+            elif result == "group_dup":
+                skipped_group += 1
+                done += 1
+            elif result == "skip":      # oversized file
+                skipped_size += 1
                 done += 1
             elif result == "ref_expired":
                 failed += 1
@@ -663,12 +680,13 @@ async def run_batch(
                 failed += 1
                 done += 1
             progress.batch_done = done
+            skipped_total = skipped_empty + skipped_group + skipped_size
             if progress_callback:
                 current_id = (msg.id if msg else (actual_start_id + done - 1))
                 try:
                     await progress_callback(
                         job_index, current_id,
-                        done, success, skipped, failed,
+                        done, success, skipped_total, failed,
                     )
                 except Exception:
                     pass
@@ -686,14 +704,14 @@ async def run_batch(
             async with download_sem:
                 if stop_signal.is_set():
                     async with results_lock:
-                        results[seq] = ("skip", m)
+                        results[seq] = ("empty", m)
                         next_seq_ready.set()
                     return
                 result = await download_msg(acc, m, caption_rules, user_id, progress)
         except asyncio.CancelledError:
             # Always store a result so consumer doesn't deadlock
             async with results_lock:
-                results[seq] = ("skip", m)
+                results[seq] = ("empty", m)
                 next_seq_ready.set()
             raise
         except Exception as e:
@@ -734,7 +752,7 @@ async def run_batch(
 
                 if not msg or msg.empty:
                     async with results_lock:
-                        results[seq] = ("skip", None)
+                        results[seq] = ("empty", None)
                         next_seq_ready.set()
                     seq += 1
                     continue
@@ -742,7 +760,7 @@ async def run_batch(
                 if msg.media_group_id:
                     if msg.media_group_id in processed_groups:
                         async with results_lock:
-                            results[seq] = ("skip", None)
+                            results[seq] = ("group_dup", None)
                             next_seq_ready.set()
                         seq += 1
                         continue
@@ -828,11 +846,22 @@ async def run_batch(
 
     # Final summary
     try:
+        skipped_total = skipped_empty + skipped_group + skipped_size
+        skip_detail = []
+        if skipped_empty:
+            skip_detail.append(f"{skipped_empty} deleted/missing")
+        if skipped_group:
+            skip_detail.append(f"{skipped_group} album extras")
+        if skipped_size:
+            skip_detail.append(f"{skipped_size} oversized")
+        skip_str = f"<b>{skipped_total}</b>"
+        if skip_detail:
+            skip_str += f" <i>({', '.join(skip_detail)})</i>"
         await status_msg.edit(
             f"<blockquote>✅ <b>{job_label or 'Batch'} Complete!</b>\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📥 Done: <b>{success}</b>\n"
-            f"⏭ Skipped: <b>{skipped}</b>\n"
+            f"✔️ Sent: <b>{success}</b>\n"
+            f"⏭ Skipped: {skip_str}\n"
             f"❌ Failed: <b>{failed}</b>\n"
             f"📊 Total: <b>{done}</b></blockquote>"
         )
@@ -847,7 +876,8 @@ async def _run_batch_fastpath(
     user_id: int = 0, batch_id: str = None, progress_callback=None,
 ):
     """Fast path: source chat is unrestricted, use server-side copy for all."""
-    done = skipped = failed = success = 0
+    done = failed = success = 0
+    skipped_empty = skipped_group = 0
     processed_groups: set = set()
     progress.set_file("Server-side copy", "⚡ Fast forwarding", extra="no transfer needed")
 
@@ -873,12 +903,12 @@ async def _run_batch_fastpath(
 
         for msg in msgs:
             if not msg or msg.empty:
-                skipped += 1
+                skipped_empty += 1
                 done += 1
                 continue
             if msg.media_group_id:
                 if msg.media_group_id in processed_groups:
-                    skipped += 1
+                    skipped_group += 1
                     done += 1
                     continue
                 processed_groups.add(msg.media_group_id)
@@ -893,18 +923,28 @@ async def _run_batch_fastpath(
             await progress.update(0, 0)
             if progress_callback:
                 try:
-                    await progress_callback(0, msg.id, done, success, skipped, failed)
+                    skipped_total = skipped_empty + skipped_group
+                    await progress_callback(0, msg.id, done, success, skipped_total, failed)
                 except Exception:
                     pass
 
         current = chunk_end + 1
 
     try:
+        skipped_total = skipped_empty + skipped_group
+        skip_detail = []
+        if skipped_empty:
+            skip_detail.append(f"{skipped_empty} deleted/missing")
+        if skipped_group:
+            skip_detail.append(f"{skipped_group} album extras")
+        skip_str = f"<b>{skipped_total}</b>"
+        if skip_detail:
+            skip_str += f" <i>({', '.join(skip_detail)})</i>"
         await status_msg.edit(
             f"<blockquote>⚡ <b>{job_label or 'Batch'} Complete (Fast)!</b>\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📥 Done: <b>{success}</b>\n"
-            f"⏭ Skipped: <b>{skipped}</b>\n"
+            f"✔️ Sent: <b>{success}</b>\n"
+            f"⏭ Skipped: {skip_str}\n"
             f"❌ Failed: <b>{failed}</b>\n"
             f"📊 Total: <b>{done}</b></blockquote>"
         )
