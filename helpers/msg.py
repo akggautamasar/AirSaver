@@ -174,7 +174,7 @@ def parse_channel_link(text: str):
     raise ValueError(f"Cannot parse channel identifier: {text!r}")
 
 
-
+async def get_parsed_msg(chat_msg) -> str:
     if chat_msg.caption:
         return chat_msg.caption.html
     elif chat_msg.text:
