@@ -12,6 +12,7 @@ except ImportError:
     _UVLOOP_OK = False
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 from config import API_ID, API_HASH, BOT_TOKEN, STRING_SESSION, LOGIN_SYSTEM
 from logger import LOGGER
 
@@ -99,7 +100,25 @@ if __name__ == "__main__":
             asyncio.create_task(keepalive(TechVJUser))
 
         bot = AirSaverBot()
-        await bot.start()
+
+        # Handle FloodWait on startup: repeated crash-restarts cause Telegram
+        # to rate-limit auth.ImportBotAuthorization. Sleep the required time
+        # instead of crashing (which would restart immediately and make it worse).
+        for _attempt in range(20):
+            try:
+                await bot.start()
+                break
+            except FloodWait as e:
+                wait = int(getattr(e, "value", 60) or 60)
+                LOGGER(__name__).warning(
+                    f"FloodWait on bot startup: {wait}s — sleeping before retry "
+                    f"(attempt {_attempt + 1}/20)"
+                )
+                await asyncio.sleep(wait + 5)
+            except Exception as e:
+                LOGGER(__name__).error(f"Bot start failed: {e}")
+                raise
+
         asyncio.create_task(keepalive(bot))
 
         LOGGER(__name__).info("All systems running. Press Ctrl+C to stop.")
