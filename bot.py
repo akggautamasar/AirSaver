@@ -79,15 +79,28 @@ if __name__ == "__main__":
 
     LOGGER(__name__).info(f"uvloop: {'enabled' if _UVLOOP_OK else 'NOT installed (fallback to asyncio)'}")
 
+    async def keepalive(client: Client):
+        """Ping Telegram every 4 minutes to keep the connection alive on Koyeb."""
+        while True:
+            try:
+                await asyncio.sleep(240)
+                await client.get_me()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+
     async def main():
         await run_health_server()
 
         if TechVJUser is not None:
             await TechVJUser.start()
             LOGGER(__name__).info("Shared user client started.")
+            asyncio.create_task(keepalive(TechVJUser))
 
         bot = AirSaverBot()
         await bot.start()
+        asyncio.create_task(keepalive(bot))
 
         LOGGER(__name__).info("All systems running. Press Ctrl+C to stop.")
         await asyncio.Event().wait()
