@@ -277,13 +277,8 @@ async def cmd_clone(bot: Client, message: Message):
         await _disconnect_if_needed(acc)
         return
 
-    # Find the first real message ID to avoid scanning from 1 needlessly
+    # Always start from 1 — producer skips deleted/empty slots efficiently
     first_id = 1
-    try:
-        async for msg in acc.get_chat_history(chat.id, limit=1, reverse=True):
-            first_id = msg.id
-    except Exception:
-        first_id = 1
 
     total_slots = last_id - first_id + 1
     target_chat, target_label = await _get_target(message)
