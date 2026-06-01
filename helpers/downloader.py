@@ -233,22 +233,23 @@ class ProgressTracker:
 
 # ── Server-side copy (instant, unrestricted sources) ──────────────────────────
 async def try_copy_message(acc: Client, msg, target_chat_id, topic_id):
-    try:
-        await acc.copy_message(
-            chat_id=target_chat_id,
-            from_chat_id=msg.chat.id,
-            message_id=msg.id,
-            message_thread_id=topic_id,
-        )
-        return True
-    except ChatForwardsRestricted:
-        return False
-    except FloodWait as e:
-        await handle_floodwait(e, target_chat_id, floodwait_guard)
-        return await try_copy_message(acc, msg, target_chat_id, topic_id)
-    except Exception as e:
-        LOGGER(__name__).warning(f"copy_message failed for {msg.id}: {e}")
-        return False
+    for _ in range(10):
+        try:
+            await acc.copy_message(
+                chat_id=target_chat_id,
+                from_chat_id=msg.chat.id,
+                message_id=msg.id,
+                message_thread_id=topic_id,
+            )
+            return True
+        except ChatForwardsRestricted:
+            return False
+        except FloodWait as e:
+            await handle_floodwait(e, target_chat_id, floodwait_guard)
+        except Exception as e:
+            LOGGER(__name__).warning(f"copy_message failed for {msg.id}: {e}")
+            return False
+    return False
 
 
 # ── Send a downloaded file (path OR BytesIO) ─────────────────────────────────
@@ -277,39 +278,37 @@ async def send_file(
     )
     thumb = None
     try:
-        if media_type == "photo":
-            kwargs.pop("progress", None)
-            await bot.send_photo(photo=media_source, **kwargs)
-        elif media_type == "video":
-            if is_inmem:
-                # Can't probe BytesIO directly — skip metadata, send as video w/ no thumb
-                await bot.send_video(
-                    video=media_source, supports_streaming=True, **kwargs,
-                )
-            else:
-                dur, w, h = await get_video_info(media_source)
-                thumb = await make_thumbnail(media_source, dur, msg_id)
-                if w == 0 and h == 0:
-                    await bot.send_document(document=media_source, **kwargs)
+        for _ in range(10):
+            try:
+                if media_type == "photo":
+                    kw = {k: v for k, v in kwargs.items() if k != "progress"}
+                    await bot.send_photo(photo=media_source, **kw)
+                elif media_type == "video":
+                    if is_inmem:
+                        await bot.send_video(
+                            video=media_source, supports_streaming=True, **kwargs,
+                        )
+                    else:
+                        dur, w, h = await get_video_info(media_source)
+                        thumb = await make_thumbnail(media_source, dur, msg_id)
+                        if w == 0 and h == 0:
+                            await bot.send_document(document=media_source, **kwargs)
+                        else:
+                            await bot.send_video(
+                                video=media_source, duration=dur, width=w, height=h,
+                                thumb=thumb, supports_streaming=True, **kwargs,
+                            )
+                elif media_type == "audio":
+                    await bot.send_audio(audio=media_source, **kwargs)
                 else:
-                    await bot.send_video(
-                        video=media_source, duration=dur, width=w, height=h,
-                        thumb=thumb, supports_streaming=True, **kwargs,
-                    )
-        elif media_type == "audio":
-            await bot.send_audio(audio=media_source, **kwargs)
-        else:
-            await bot.send_document(document=media_source, **kwargs)
-        return True
-    except FloodWait as e:
-        await handle_floodwait(e, chat_id, floodwait_guard)
-        # On retry, reset BytesIO position
-        if is_inmem:
-            media_source.seek(0)
-        return await send_file(
-            bot, chat_id, media_source, media_type, caption,
-            topic_id, msg_id, progress_cb, file_size, is_inmem, filename,
-        )
+                    await bot.send_document(document=media_source, **kwargs)
+                return True
+            except FloodWait as e:
+                await handle_floodwait(e, chat_id, floodwait_guard)
+                if is_inmem:
+                    media_source.seek(0)
+                continue
+        return False
     except Exception as e:
         LOGGER(__name__).error(f"send_file error: {e}")
         return False
@@ -405,10 +404,16 @@ async def download_msg(
         if progress:
             await progress.update(current, total)
 
+    # 10 min timeout per file; large files (>200 MB on disk) get 30 min
+    dl_timeout = 1800 if not use_inmem else 600
+
     for attempt in range(3):
         try:
             if use_inmem:
-                buf = await msg.download(in_memory=True, progress=_dl_progress)
+                buf = await asyncio.wait_for(
+                    msg.download(in_memory=True, progress=_dl_progress),
+                    timeout=dl_timeout,
+                )
                 if not buf:
                     return "error"
                 return DownloadedItem(
@@ -417,13 +422,21 @@ async def download_msg(
                 )
             else:
                 path = get_download_path(msg.id, filename)
-                path = await msg.download(file_name=path, progress=_dl_progress)
+                path = await asyncio.wait_for(
+                    msg.download(file_name=path, progress=_dl_progress),
+                    timeout=dl_timeout,
+                )
                 if not path or not os.path.exists(path):
                     return "error"
                 return DownloadedItem(
                     msg, media_type, caption, filename, msg.id, file_size,
                     media_path=path,
                 )
+        except asyncio.TimeoutError:
+            LOGGER(__name__).warning(f"Download timed out for msg {msg.id}, attempt {attempt+1}")
+            if attempt == 2:
+                return "error"
+            await asyncio.sleep(2)
         except FloodWait as e:
             await handle_floodwait(e, msg.chat.id if msg.chat else None, floodwait_guard)
         except FileReferenceExpired:
@@ -668,12 +681,20 @@ async def run_batch(
 
     async def _dl_and_store(seq, m):
         """Download a message and stash the result at its sequence slot."""
+        result = "skip"
         try:
             async with download_sem:
                 if stop_signal.is_set():
+                    async with results_lock:
+                        results[seq] = ("skip", m)
+                        next_seq_ready.set()
                     return
                 result = await download_msg(acc, m, caption_rules, user_id, progress)
         except asyncio.CancelledError:
+            # Always store a result so consumer doesn't deadlock
+            async with results_lock:
+                results[seq] = ("skip", m)
+                next_seq_ready.set()
             raise
         except Exception as e:
             LOGGER(__name__).error(f"Download task error msg {m.id}: {e}")
@@ -692,9 +713,16 @@ async def run_batch(
             chunk_ids = list(range(current, chunk_end + 1))
 
             try:
-                msgs = await acc.get_messages(chat_id=chat_id, message_ids=chunk_ids)
+                msgs = await asyncio.wait_for(
+                    acc.get_messages(chat_id=chat_id, message_ids=chunk_ids),
+                    timeout=90,
+                )
                 if not isinstance(msgs, list):
                     msgs = [msgs]
+            except asyncio.TimeoutError:
+                LOGGER(__name__).warning(f"get_messages timed out for chunk {current}-{chunk_end}, retrying")
+                await asyncio.sleep(5)
+                continue
             except Exception as e:
                 LOGGER(__name__).error(f"get_messages failed: {e}")
                 current = chunk_end + 1
@@ -720,16 +748,6 @@ async def run_batch(
                         continue
                     processed_groups.add(msg.media_group_id)
 
-                # Simple cases (text, media group): wait for current seq before
-                # sending — otherwise text would jump ahead of pending downloads.
-                # We mark these as a special "synchronous" result and let the
-                # consumer execute them in order.
-                if not bool(msg.document or msg.video or msg.audio or msg.photo
-                            or msg.animation or msg.voice or msg.video_note
-                            or msg.sticker or msg.media_group_id):
-                    # Pure text — process via process_simple in the consumer's turn
-                    pass
-
                 if msg.media_group_id or not bool(
                     msg.document or msg.video or msg.audio or msg.photo
                     or msg.animation or msg.voice or msg.video_note or msg.sticker
@@ -741,21 +759,28 @@ async def run_batch(
                     seq += 1
                     continue
 
-                # Throttle producer if too many in-flight downloads
-                while len(pending_downloads) - sum(1 for t in pending_downloads if t.done()) >= PARALLEL_FILES + 1:
-                    await asyncio.sleep(0.5)
+                # Throttle producer: count only alive tasks (O(1) with pruning below)
+                while sum(1 for t in pending_downloads if not t.done()) >= PARALLEL_FILES + 1:
+                    await asyncio.sleep(0.2)
 
                 task = asyncio.create_task(_dl_and_store(seq, msg))
                 pending_downloads.append(task)
                 seq += 1
 
-                await asyncio.sleep(WAITING_TIME)
+                # Prune finished tasks to keep the list small
+                if len(pending_downloads) % 50 == 0:
+                    pending_downloads[:] = [t for t in pending_downloads if not t.done()]
+
+                if WAITING_TIME > 0:
+                    await asyncio.sleep(WAITING_TIME)
 
             current = chunk_end + 1
 
-        # Wait for all downloads, then signal end
+        # Wait for all downloads to finish, then signal consumer
         if pending_downloads:
-            await asyncio.gather(*pending_downloads, return_exceptions=True)
+            alive = [t for t in pending_downloads if not t.done()]
+            if alive:
+                await asyncio.gather(*alive, return_exceptions=True)
         producer_done.set()
         next_seq_ready.set()  # wake the consumer
 
@@ -772,7 +797,11 @@ async def run_batch(
                     if producer_done.is_set() and not pending_downloads_alive():
                         return
                     next_seq_ready.clear()
-                await next_seq_ready.wait()
+                # Timeout prevents a permanent deadlock if an event is ever missed
+                try:
+                    await asyncio.wait_for(next_seq_ready.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    pass
 
             # Handle deferred simple message (text/group) here, in order
             if isinstance(result, tuple) and len(result) == 2 and result[0] == "__simple__":
@@ -828,9 +857,16 @@ async def _run_batch_fastpath(
         chunk_ids = list(range(current, chunk_end + 1))
 
         try:
-            msgs = await acc.get_messages(chat_id=chat_id, message_ids=chunk_ids)
+            msgs = await asyncio.wait_for(
+                acc.get_messages(chat_id=chat_id, message_ids=chunk_ids),
+                timeout=90,
+            )
             if not isinstance(msgs, list):
                 msgs = [msgs]
+        except asyncio.TimeoutError:
+            LOGGER(__name__).warning(f"get_messages timed out (fast path) chunk {current}-{chunk_end}, retrying")
+            await asyncio.sleep(5)
+            continue
         except Exception:
             current = chunk_end + 1
             continue
@@ -860,7 +896,6 @@ async def _run_batch_fastpath(
                     await progress_callback(0, msg.id, done, success, skipped, failed)
                 except Exception:
                     pass
-            await asyncio.sleep(0.5)  # lighter throttle for fast path
 
         current = chunk_end + 1
 
