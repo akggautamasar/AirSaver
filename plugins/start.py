@@ -25,7 +25,6 @@ async def start(client: Client, message: Message):
     status = "✅ Logged in" if session else "❌ Not logged in — use /login"
     dest_text = f"📤 **{dest_label}**" if dest else "📤 **This chat**"
 
-    # Check for resumable batches
     paused = await db.get_active_batches(message.from_user.id)
     paused_line = ""
     if paused:
@@ -42,12 +41,14 @@ async def start(client: Client, message: Message):
         "**Quick start:**\n"
         "• Send any post link → download it\n"
         "• `link1 - link2` → batch range\n"
-        "• /clone → clone an entire channel/group\n"
+        "• /clone → clone an entire channel/group/topic\n"
         "• /playlist → send multiple links at once\n"
         "• /setchannel → send files to a channel/group\n"
         "• /resume → continue paused batches\n"
         "• /cancel → stop your current task\n"
-        "• /help → full help",
+        "• /help → full help\n\n"
+        "💡 **Tip:** Forward any message from a private group to me — "
+        "I'll tell you its ID and the exact /clone command.",
         disable_web_page_preview=True,
     )
 
@@ -73,8 +74,14 @@ async def help_cmd(client: Client, message: Message):
         "**Clone entire channel/group:**\n"
         "`/clone https://t.me/channelname`\n"
         "`/clone https://t.me/c/1234567890`\n"
-        "`/clone @channelname`\n"
-        "Finds first → last message automatically\n\n"
+        "`/clone @channelname`\n\n"
+        "**Clone a specific topic thread only:**\n"
+        "`/clone https://t.me/c/1234567890/5/1`\n"
+        "`/clone https://t.me/groupname/5/1`\n"
+        "_(the number after the group ID is the topic ID)_\n\n"
+        "**Get ID of a private group:**\n"
+        "Forward any message from it to me — I reply with the ID\n"
+        "and the ready /clone command.\n\n"
         "**Destination:**\n"
         "/setchannel — send downloads to a channel/group\n"
         "/destination — show current destination\n"
@@ -93,35 +100,55 @@ async def help_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.private & filters.forwarded)
 async def handle_forwarded(client: Client, message: Message):
-    """Reply with chat ID + ready /clone command when user forwards a message."""
+    """Show chat ID + /clone command when user forwards a message from any chat."""
     chat = getattr(message, "forward_from_chat", None)
     if not chat:
-        # Forwarded from a user, not a channel/group — ignore silently
-        return
+        return  # forwarded from a user, not a channel/group
 
     chat_id = chat.id
     chat_name = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat_id)
 
-    # Build a usable reference for /clone
+    # Build the base link for /clone
     if chat.username:
-        clone_ref = f"https://t.me/{chat.username}"
+        base_ref = f"https://t.me/{chat.username}"
     elif str(chat_id).startswith("-100"):
-        raw_id = str(chat_id)[4:]   # strip the -100 prefix
-        clone_ref = f"https://t.me/c/{raw_id}"
+        raw_id = str(chat_id)[4:]
+        base_ref = f"https://t.me/c/{raw_id}"
     else:
-        clone_ref = str(chat_id)
+        base_ref = str(chat_id)
+
+    # Try to include the forwarded message ID so the user can see the full link
+    fwd_msg_id = getattr(message, "forward_from_message_id", None)
+    msg_link_line = ""
+    if fwd_msg_id:
+        msg_link_line = (
+            f"\n<b>Forwarded message link:</b>\n"
+            f"<code>{base_ref}/{fwd_msg_id}</code>\n"
+        )
+
+    topic_section = (
+        f"\n<b>📌 For topic groups:</b>\n"
+        f"Right-click the original message → <b>Copy Link</b>\n"
+        f"If the link looks like:\n"
+        f"<code>https://t.me/c/ID/TOPIC/MSGID</code>\n"
+        f"Clone that topic with:\n"
+        f"<code>/clone {base_ref}/TOPIC/MSGID</code>\n"
+        f"<i>(replace TOPIC and MSGID with the actual numbers)</i>"
+    )
 
     await message.reply(
         f"<b>📋 Chat identified</b>\n\n"
         f"<b>Name:</b> {chat_name}\n"
-        f"<b>ID:</b> <code>{chat_id}</code>\n\n"
-        f"<b>Clone this chat:</b>\n"
-        f"<code>/clone {clone_ref}</code>",
+        f"<b>ID:</b> <code>{chat_id}</code>\n"
+        f"{msg_link_line}\n"
+        f"<b>Clone entire chat:</b>\n"
+        f"<code>/clone {base_ref}</code>\n"
+        f"{topic_section}",
         quote=True,
     )
 
 
-
+@Client.on_message(filters.private & filters.command("stats"))
 async def stats(client: Client, message: Message):
     uptime = get_readable_time(time() - BOT_START_TIME)
     total_users = await db.total_users_count()

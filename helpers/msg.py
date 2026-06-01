@@ -131,17 +131,19 @@ def parse_playlist_input(text: str):
 
 def parse_channel_link(text: str):
     """
-    Parse a channel/group reference (not a specific message link).
+    Parse a channel/group/topic reference for /clone.
 
     Accepts:
-      https://t.me/username
-      https://t.me/c/1234567890
+      https://t.me/username                   → clone whole channel/group
+      https://t.me/username/TOPIC/MSGID       → clone specific topic
+      https://t.me/c/1234567890               → clone whole private channel/group
+      https://t.me/c/1234567890/TOPIC/MSGID   → clone specific topic
       https://t.me/+invitehash
-      @username
-      username
+      @username  /  plain username
 
-    Returns (chat_id, topic_id).  topic_id is None for full-channel clone.
-    chat_id is a str username or a negative int for private channels.
+    Returns (chat_id, topic_id).
+      topic_id is None  → clone everything
+      topic_id is int   → clone only that topic thread
     """
     text = text.strip().rstrip("/")
     if "?" in text:
@@ -156,15 +158,34 @@ def parse_channel_link(text: str):
         if not segments:
             raise ValueError("Could not parse channel link — path is empty.")
         first = segments[0]
+
         if first.startswith("+"):
-            # Invite link — return as-is; caller must join before fetching history
+            # Invite link — return as-is
             return text, None
+
         if first == "c":
             if len(segments) < 2:
                 raise ValueError("Private channel link requires a channel ID after /c/.")
             chat_id = get_channel_id(int(segments[1]))
+            # t.me/c/CID/TOPIC/MSGID  → 4 segments → has topic
+            if len(segments) >= 4:
+                try:
+                    topic_id = int(segments[2])
+                    return chat_id, topic_id
+                except ValueError:
+                    pass
+            # t.me/c/CID  or  t.me/c/CID/MSGID  → no topic
             return chat_id, None
-        # Public channel: t.me/username[/anything...]
+
+        # Public: t.me/username[/TOPIC[/MSGID]]
+        # username/TOPIC/MSGID → 3 segments → has topic
+        if len(segments) >= 3:
+            try:
+                topic_id = int(segments[1])
+                return first, topic_id
+            except ValueError:
+                pass
+        # username  or  username/MSGID
         return first, None
 
     # Plain username (no @, no t.me)
